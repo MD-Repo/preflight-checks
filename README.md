@@ -11,15 +11,53 @@ first turns a slow, confusing failure into a fast, specific one.
 
 Checks AMBER simulation directories against their own topology.
 
+### Install
+
+Needs Python 3.11 or newer (for `tomllib`), plus `numpy` and `scipy`.
+
+**With `uv` (easiest — no environment to manage).** `uv` reads the dependencies
+declared at the top of the script and fetches them itself the first time you run
+it. Install `uv` once:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh     # macOS and Linux
+```
+
+then clone and run:
+
+```bash
+git clone https://github.com/MD-Repo/preflight-checks
+cd preflight-checks
+uv run check_amber.py --headers-only path/to/simulations
+```
+
+**With a virtual environment**, if you would rather not install `uv`:
+
+```bash
+git clone https://github.com/MD-Repo/preflight-checks
+cd preflight-checks
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/python check_amber.py --headers-only path/to/simulations
+```
+
+If you already have numpy and scipy available — through conda, or a system
+Python that has them — skip both and run `./check_amber.py` directly.
+
+### Usage
+
+Substitute whichever of the three invocations above you set up; the examples
+here use `uv run`.
+
 ```bash
 # One directory, or a parent holding many
-./check_amber.py path/to/simulations
+uv run check_amber.py path/to/simulations
 
 # Fast pass: atom counts only, reads no trajectory data
-./check_amber.py --headers-only path/to/simulations
+uv run check_amber.py --headers-only path/to/simulations
 
 # Write a plain-text report of the problems found
-./check_amber.py -r problems.txt path/to/simulations
+uv run check_amber.py -r problems.txt path/to/simulations
 ```
 
 Directories are found by looking for `mdrepo-metadata.toml`, and every
@@ -39,9 +77,7 @@ Everything except `ZERO FRAMES` is a header read, which is why `--headers-only`
 is fast enough to run over a whole submission in seconds. The zero-frame scan
 reads coordinates and is roughly disk-speed.
 
+Nothing is ever modified: the checks only read.
+
 Exit status is 0 when everything is clean and 1 when anything was flagged, so it
 can gate a submission script.
-
-### Requirements
-
-Python 3.11+ (for `tomllib`), `numpy` and `scipy`.

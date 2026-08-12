@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["numpy", "scipy"]
+# ///
 """
 Author : Ken Youens-Clark <kyclark@arizona.edu>
 Date   : 2026-08-12
@@ -49,8 +53,18 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
-import numpy as np
-from scipy.io import netcdf_file
+try:
+    import numpy as np
+    from scipy.io import netcdf_file
+except ImportError as err:
+    sys.exit(
+        f"{err}\n\n"
+        "This needs numpy and scipy, which are not installed. From the "
+        "directory holding this script:\n\n"
+        "    python3 -m venv .venv\n"
+        "    ./.venv/bin/pip install -r requirements.txt\n"
+        "    ./.venv/bin/python check_amber.py --help\n"
+    )
 
 # scipy warns on closing an mmap'd NetCDF while array views onto it still
 # exist. That is exactly how this reads coordinates -- in chunks, copying each
