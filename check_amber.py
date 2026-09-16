@@ -26,12 +26,36 @@ missing output file rather than the cause.
   They carry a valid checksum and a correct manifest, so nothing upstream of
   this notices.
 
+  BAD UNIT CELL -- frames whose box is not a box: a length or an angle that is
+  not a finite number, a length that is zero or negative, or an angle outside
+  0 to 180 degrees. Two submissions have arrived this way, one carrying a box
+  of exact zeros and one carrying values like 1.46e+233. A frame like this can
+  hang the conversion step for hours rather than fail it. The cell arrays are
+  three numbers per frame against tens of thousands of coordinates, so this
+  runs even under --headers-only -- though NetCDF stores each frame's records
+  together, so reading them still walks the whole file rather than just its
+  header.
+
+  It is not a substitute for BAD COORDINATES below. One file of the second
+  submission carries damaged frames under a box identical to its neighbours',
+  and only the coordinate scan finds it.
+
   ZERO FRAMES -- frames in which every coordinate of every atom is exactly 0.0,
   the signature of a partially written file. They read as valid NetCDF and
   survive conversion, then break the analysis stage: fitting an all-zero frame
   produces coordinates that overflow the XTC integer encoding, and the RMSD /
   RMSF step rejects the result. Finding these needs the coordinate data, so
   unlike the checks above it is not free and not available before upload.
+
+  BAD COORDINATES -- frames holding coordinates that are not positions: NaN,
+  infinity, or a number so large it cannot describe an atom. These come from a
+  writer that put uninitialised memory into the file instead of data. The size
+  test is not redundant: XTC cannot store NaN, so a damaged frame written
+  through one comes back as a finite 21,474,836 angstroms, and a test for
+  finiteness alone would pass it. They read as valid NetCDF, survive conversion, and
+  reach the analysis stage, where they either stall it or produce numbers that
+  mean nothing. Reading them needs the coordinate data, so this rides along
+  with the zero-frame scan and costs nothing on top of it.
 
   NO TIME AXIS -- a NetCDF trajectory with no `time` variable. Frame spacing
   cannot be read from such a file, so MDRepo cannot derive the duration or the
@@ -79,6 +103,17 @@ warnings.filterwarnings(
 # Frames are read in blocks so a large trajectory never lands in memory whole.
 CHUNK_FRAMES = 256
 
+# A coordinate this large is not a position. It is 0.1 mm, where a simulation
+# box is a few hundred angstroms at most.
+#
+# The check matters because XTC cannot store NaN: writing one saturates the
+# 32-bit integer encoding, and the value reads back as +/-21,474,836 A -- a
+# finite, non-zero number that a finiteness test passes. That saturation is the
+# signature the RMSD/RMSF ceiling sees after conversion, and it is the only
+# trace a damaged frame leaves in an XTC. Without this, screening an XTC would
+# find nothing.
+MAX_ABS_COORD = 1.0e6
+
 
 class Args(NamedTuple):
     """Command-line arguments"""
@@ -102,6 +137,10 @@ class Finding(NamedTuple):
     frames: Optional[int]
     zero_frames: int
     zero_runs: List[Tuple[int, int]]
+    bad_cell_frames: int
+    bad_cell_runs: List[Tuple[int, int]]
+    bad_coord_frames: int
+    bad_coord_runs: List[Tuple[int, int]]
     has_time: Optional[bool]
     problems: List[str]
     error: Optional[str]
@@ -135,7 +174,7 @@ def get_args() -> Args:
     parser.add_argument(
         "--headers-only",
         action="store_true",
-        help="Atom counts only; skips the zero-frame scan, reads no coordinates",
+        help="Skip the coordinate scans; reads headers and the unit cell only",
     )
 
     parser.add_argument(
@@ -216,26 +255,84 @@ def read_prmtop_natom(path: str) -> int:
 
 
 # --------------------------------------------------
-def scan_zero_frames(coords) -> Tuple[int, List[Tuple[int, int]]]:
-    """Count all-zero coordinate frames, grouped into contiguous runs"""
+def group_runs(indexes: List[int]) -> List[Tuple[int, int]]:
+    """Group ascending frame indexes into contiguous runs"""
 
-    zero_idx = []
+    grouped: List[Tuple[int, int]] = []
+    for idx in indexes:
+        if grouped and idx == grouped[-1][1] + 1:
+            grouped[-1] = (grouped[-1][0], idx)
+        else:
+            grouped.append((idx, idx))
+
+    return grouped
+
+
+# --------------------------------------------------
+def scan_cell(lengths, angles) -> List[int]:
+    """
+    Find frames whose unit cell is not a usable box
+
+    A length or an angle that is not finite, a length that is zero or
+    negative, or an angle outside 0 to 180 degrees cannot describe a box.
+
+    The one case that is not a defect is a trajectory with no periodic box at
+    all, which some writers record as zero lengths in every frame. That is why
+    the all-zero file returns early instead of reporting every frame: the
+    signal we are after is a box that disappears partway through a file whose
+    other frames have one.
+    """
+
+    lengths = np.asarray(lengths, dtype=np.float64)
+    angles = np.asarray(angles, dtype=np.float64)
+
+    if lengths.ndim != 2 or angles.ndim != 2:
+        return []
+
+    no_box = (lengths == 0).all(axis=1)
+    if no_box.all():
+        return []
+
+    bad = ~np.isfinite(lengths).all(axis=1)
+    bad |= ~np.isfinite(angles).all(axis=1)
+    bad |= (lengths <= 0).any(axis=1)
+    bad |= (angles <= 0).any(axis=1)
+    bad |= (angles >= 180).any(axis=1)
+
+    return [int(i) for i in np.where(bad)[0]]
+
+
+# --------------------------------------------------
+def scan_coordinates(coords) -> Tuple[List[int], List[int], List[int]]:
+    """
+    Find all-zero frames and frames holding values that are not finite
+
+    Both answers come out of one pass, because the coordinates are the only
+    expensive thing this program reads and there is no reason to read them
+    twice. The two results never overlap: a frame of exact zeros is finite.
+    """
+
+    zero: List[int] = []
+    nonfinite: List[int] = []
+    huge: List[int] = []
     total = coords.shape[0]
 
     for start in range(0, total, CHUNK_FRAMES):
         block = np.asarray(coords[start : start + CHUNK_FRAMES])
         flat = block.reshape(block.shape[0], -1)
-        for offset in np.where(~flat.any(axis=1))[0]:
-            zero_idx.append(start + int(offset))
 
-    runs: List[Tuple[int, int]] = []
-    for idx in zero_idx:
-        if runs and idx == runs[-1][1] + 1:
-            runs[-1] = (runs[-1][0], idx)
-        else:
-            runs.append((idx, idx))
+        finite = np.isfinite(flat).all(axis=1)
+        for offset in np.where(~finite)[0]:
+            nonfinite.append(start + int(offset))
+        for offset in np.where(finite & ~flat.any(axis=1))[0]:
+            zero.append(start + int(offset))
 
-    return len(zero_idx), runs
+        big = finite & (np.abs(np.where(finite[:, None], flat, 0.0))
+                        >= MAX_ABS_COORD).any(axis=1)
+        for offset in np.where(big)[0]:
+            huge.append(start + int(offset))
+
+    return zero, nonfinite, huge
 
 
 # --------------------------------------------------
@@ -258,6 +355,10 @@ def check_dir(directory: str, headers_only: bool) -> List[Finding]:
         frames=None,
         zero_frames=0,
         zero_runs=[],
+        bad_cell_frames=0,
+        bad_cell_runs=[],
+        bad_coord_frames=0,
+        bad_coord_runs=[],
         has_time=None,
         problems=[],
     )
@@ -309,6 +410,10 @@ def check_trajectory(
         frames=None,
         zero_frames=0,
         zero_runs=[],
+        bad_cell_frames=0,
+        bad_cell_runs=[],
+        bad_coord_frames=0,
+        bad_coord_runs=[],
         has_time=None,
         problems=[],
     )
@@ -351,16 +456,45 @@ def check_trajectory(
             if not has_time:
                 problems.append("NO TIME AXIS")
 
+            # The cell arrays are three numbers per frame against tens of
+            # thousands of coordinates, so this runs whatever the atom counts
+            # say and whatever --headers-only says. It is the check that costs
+            # least and, on the two submissions that prompted it, the only one
+            # that fires.
+            bad_cell: List[int] = []
+            if "cell_lengths" in ncf.variables and "cell_angles" in ncf.variables:
+                bad_cell = scan_cell(
+                    ncf.variables["cell_lengths"][:],
+                    ncf.variables["cell_angles"][:],
+                )
+                if bad_cell:
+                    problems.append("BAD UNIT CELL")
+
             # Only scan coordinates when the pair is coherent: a mismatched
             # pair cannot be processed anyway, and the scan is the only
             # expensive thing here.
-            zero_frames, zero_runs = 0, []
+            zero_idx: List[int] = []
+            nonfinite_idx: List[int] = []
             if not headers_only and traj_atoms == top_atoms:
-                zero_frames, zero_runs = scan_zero_frames(coords)
-                if zero_frames:
+                zero_idx, unfinite, huge = scan_coordinates(coords)
+                # One defect with two faces. A coordinate of 3.4e38 written
+                # into an XTC comes back as 21,474,836 -- finite, and just as
+                # impossible -- so reporting them apart would tell a submitter
+                # that two different things went wrong with one frame.
+                nonfinite_idx = sorted(set(unfinite) | set(huge))
+                if zero_idx:
                     problems.append("ZERO FRAMES")
+                if nonfinite_idx:
+                    problems.append("BAD COORDINATES")
 
-            blank.update(zero_frames=zero_frames, zero_runs=zero_runs)
+            blank.update(
+                zero_frames=len(zero_idx),
+                zero_runs=group_runs(zero_idx),
+                bad_cell_frames=len(bad_cell),
+                bad_cell_runs=group_runs(bad_cell),
+                bad_coord_frames=len(nonfinite_idx),
+                bad_coord_runs=group_runs(nonfinite_idx),
+            )
     except Exception as err:
         return Finding(**blank, error=f"unreadable trajectory: {err}")
 
@@ -388,6 +522,17 @@ def describe(finding: Finding) -> str:
         elif problem == "ZERO FRAMES":
             parts.append(
                 f"ZERO FRAMES {finding.zero_frames} of {finding.frames}"
+            )
+        elif problem == "BAD UNIT CELL":
+            parts.append(
+                f"BAD UNIT CELL {finding.bad_cell_frames} of {finding.frames} "
+                f"(frames {format_runs(finding.bad_cell_runs)})"
+            )
+        elif problem == "BAD COORDINATES":
+            parts.append(
+                f"BAD COORDINATES {finding.bad_coord_frames} of "
+                f"{finding.frames} (frames "
+                f"{format_runs(finding.bad_coord_runs)})"
             )
         elif problem == "EMPTY TRAJECTORY":
             parts.append(f"EMPTY TRAJECTORY {finding.traj_size} bytes")
@@ -432,6 +577,8 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
     mismatches = [f for f in findings if "ATOM MISMATCH" in f.problems]
     empties = [f for f in findings if "EMPTY TRAJECTORY" in f.problems]
     zeros = [f for f in findings if "ZERO FRAMES" in f.problems]
+    bad_cell = [f for f in findings if "BAD UNIT CELL" in f.problems]
+    bad_coord = [f for f in findings if "BAD COORDINATES" in f.problems]
     no_time = [f for f in findings if "NO TIME AXIS" in f.problems]
     errors = [f for f in findings if f.error]
     clean = [f for f in findings if not f.problems and not f.error]
@@ -485,6 +632,28 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
             for f in sorted(empties, key=lambda f: f.trajectory)
         ]
 
+    if bad_cell:
+        section += 1
+        out += [
+            "",
+            f"{section}. TRAJECTORIES CONTAIN FRAMES WITH NO USABLE BOX "
+            f"({sims(len(bad_cell))})",
+            "",
+            "   Some frames record a unit cell that cannot describe a box:",
+            "   a length or angle that is not a finite number, a length of",
+            "   zero or less, or an angle outside 0 to 180 degrees. The frames",
+            "   on either side are usually ordinary, which is what makes this",
+            "   easy to miss. A frame like this can stall the conversion step",
+            "   for hours instead of failing it, so these must be rewritten or",
+            "   removed before the data is submitted.",
+            "",
+        ]
+        out += [
+            f"   {f.trajectory}: {f.bad_cell_frames} of {f.frames} frames "
+            f"(frames {format_runs(f.bad_cell_runs)})"
+            for f in sorted(bad_cell, key=lambda f: f.trajectory)
+        ]
+
     if zeros:
         section += 1
         out += [
@@ -503,6 +672,26 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
             f"   {f.trajectory}: {f.zero_frames} of {f.frames} frames are "
             f"all-zero (frames {format_runs(f.zero_runs)})"
             for f in sorted(zeros, key=lambda f: f.trajectory)
+        ]
+
+    if bad_coord:
+        section += 1
+        out += [
+            "",
+            f"{section}. TRAJECTORIES CONTAIN COORDINATES THAT ARE NOT "
+            f"NUMBERS ({sims(len(bad_coord))})",
+            "",
+            "   Some frames hold coordinates that are NaN or infinity rather",
+            "   than a position. This is what uninitialised memory looks like",
+            "   when it is written to a file as if it were data. The affected",
+            "   frames cannot be recovered; these need rewriting, or those",
+            "   frames removed.",
+            "",
+        ]
+        out += [
+            f"   {f.trajectory}: {f.bad_coord_frames} of {f.frames} frames "
+            f"(frames {format_runs(f.bad_coord_runs)})"
+            for f in sorted(bad_coord, key=lambda f: f.trajectory)
         ]
 
     if no_time:
@@ -533,7 +722,9 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
     if headers_only:
         out += [
             "",
-            "Note: run without --headers-only to also scan for zero frames.",
+            "Note: run without --headers-only to also scan the coordinates,",
+            "which is what finds all-zero frames and coordinates that are not",
+            "numbers. The unit cell was checked either way.",
         ]
 
     return "\n".join(out)
