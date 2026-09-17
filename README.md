@@ -26,7 +26,8 @@ Checks simulation directories of any engine against their own topology.
 
 ### Install
 
-Needs Python 3.11 or newer (for `tomllib`), plus `numpy` and `scipy`.
+Needs Python 3.11 or newer (for `tomllib`). `check_amber.py` needs `numpy` and
+`scipy`; `check_simulations.py` also needs `mdanalysis`.
 
 **With `uv` (easiest — no environment to manage).** `uv` reads the dependencies
 declared at the top of the script and fetches them itself the first time you run

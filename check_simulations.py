@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["numpy", "scipy", "mdanalysis"]
+# dependencies = ["numpy", "scipy", "mdanalysis>=2.10.0"]
 # ///
 """
 Author : Ken Youens-Clark <kyclark@arizona.edu>

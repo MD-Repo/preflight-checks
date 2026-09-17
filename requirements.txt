@@ -1,2 +1,6 @@
 numpy
 scipy
+# check_simulations.py only; check_amber.py needs numpy and scipy alone.
+# The floor matches what MDRepo's own pipeline runs, so the two cannot
+# disagree about a trajectory because they read it with different versions.
+mdanalysis>=2.10.0
