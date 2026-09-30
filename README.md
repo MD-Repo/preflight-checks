@@ -18,7 +18,7 @@ on the same file — that agreement is covered by a test. There is no reason to
 switch a working NetCDF-only setup, and no reason to start there.
 
 The checks below describe `check_simulations.py`. `check_amber.py` has all of
-them except `IMPLAUSIBLE TIMESTEP`, and only for `.nc` files.
+them except `IMPLAUSIBLE TIMESTEP` and `FRAME JUMPS`, and only for `.nc` files.
 
 ## check_simulations.py
 
@@ -90,10 +90,11 @@ trajectory named in `trajectory_file_names` is checked against the topology in
 | `BAD UNIT CELL` | Some frames record a box that is not a box: a length or angle that is not a finite number, a length of zero or less, or an angle outside 0 to 180 degrees. A frame like this can stall the conversion step for hours rather than fail it. | no |
 | `ZERO FRAMES` | Some frames hold `0.0` for every coordinate of every atom — a partially written file. These read as valid NetCDF and survive conversion, then break the analysis stage. | yes |
 | `BAD COORDINATES` | Some frames hold coordinates that are not positions — NaN, infinity, or 1e6 Å and up. This is what uninitialised memory looks like written to a file as if it were data. These survive conversion, and the box on such a frame is often perfectly ordinary, so nothing cheaper finds them. The size test matters because XTC cannot store a NaN: written through one, the same damage reads back as a finite 21,474,836 Å. | yes |
+| `FRAME JUMPS` | In some frames an atom has moved 5,000 Å or more since the frame before (or twice the box diagonal, if that is larger). One submission's damaged last frames moved whole protein chains by one constant offset of 10⁴–10⁷ Å, often well under the `BAD COORDINATES` limit. Wrapping in a periodic box moves an atom at most one box diagonal, so it never trips this. If a file joins separate runs, a step where time jumps forward or starts again is treated as the join and not tested — unless the part after it is a single frame. | yes |
 | `NO TIME AXIS` | The NetCDF has no `time` variable, so frame spacing cannot be read from it. Either rewrite with time information, or declare `sampling_frequency_ps` in `mdrepo-metadata.toml`. **NetCDF only** — see below. | no |
 | `IMPLAUSIBLE TIMESTEP` | A DCD whose header declares a frame spacing below 1e-4 ps, which means the header carries a placeholder rather than the value. | no |
 
-`--headers-only` skips the two checks that read coordinates. It still checks
+`--headers-only` skips the three checks that read coordinates. It still checks
 the unit cell, because the cell arrays are three numbers per frame against tens
 of thousands of coordinates — cheap, though not as cheap as a true header read,
 since NetCDF keeps each frame's records together and reading them walks the
@@ -135,7 +136,7 @@ can gate a submission script.
 
 Both scripts are covered by a corpus of synthetic trajectories built from the
 defects that have actually arrived, and one test asserts the two agree on the
-same file. MDRepo's own pipeline carries the same two
+same file. MDRepo's own pipeline carries the same
 frame checks in `screen_trajectory.py` and is tested against the same cases, so
 that this tool and the pipeline cannot drift apart and disagree about whether a
 submission is sound.

@@ -44,6 +44,16 @@ needs a topology for none of them.
   has been through an XTC therefore carries the damage as an ordinary-looking
   number.
 
+  FRAME JUMPS -- frames in which an atom has moved MAX_JUMP (5,000 A) or more
+  from the frame before, or twice the box diagonal if that is larger. The
+  Dissociation Dynamic Database sent last frames that move whole protein
+  chains by one constant offset of 1e4-1e7 A; five of twelve never reach the
+  BAD COORDINATES size limit. Wrapping in a periodic box moves an atom at most
+  one diagonal, which is why the limit grows with the box. A step where time
+  jumps or starts again is where joined runs meet, and is not tested, unless
+  the block after it is a single frame. The same rule as the pipeline's
+  screen_trajectory.py.
+
   NO TIME AXIS -- NetCDF only, and deliberately so. Frame spacing cannot be
   read from a NetCDF with no `time` variable, so MDRepo cannot derive the
   duration; declare `sampling_frequency_ps` in mdrepo-metadata.toml instead.
@@ -96,6 +106,17 @@ CHUNK_FRAMES = 256
 # XTC saturates a NaN to.
 MAX_ABS_COORD = 1.0e6
 
+# An atom that moves this far between consecutive frames has not moved: the
+# frame is damaged. The limit is this, or twice the frame's own box diagonal if
+# that is larger -- a wrapped trajectory legitimately moves an atom up to one
+# diagonal when it leaves one corner and comes back through the opposite one.
+# The same rule, and the same numbers, as MDRepo's screen_trajectory.py.
+MAX_JUMP = 5.0e3
+
+# Two frames are consecutive in time when their spacing is within this share
+# of the file's regular step. float32 times wander in the last digits.
+STEP_TOLERANCE = 0.01
+
 # Below this, a DCD's declared spacing is a placeholder rather than a number.
 FLOOR_PS = 1.0e-4
 
@@ -128,6 +149,9 @@ class Finding(NamedTuple):
     bad_cell_runs: List[Tuple[int, int]]
     bad_coord_frames: int
     bad_coord_runs: List[Tuple[int, int]]
+    jump_frames: int
+    jump_runs: List[Tuple[int, int]]
+    time_breaks: List[int]
     timestep_ps: Optional[float]
     read_error: Optional[str]
     problems: List[str]
@@ -265,6 +289,138 @@ def scan_cell(lengths, angles) -> List[int]:
 
 
 # --------------------------------------------------
+# FRAME JUMPS. The functions from here to classify_frame are copied from
+# MDRepo's screen_trajectory.py and must stay identical to it.
+
+
+# --------------------------------------------------
+def box_diagonal(lengths, angles) -> Optional[float]:
+    """
+    The longest distance a wrap can move an atom in one box, or None
+
+    Wrapping moves an atom by a sum of box vectors, at most one of each, so the
+    longest move is the longest of a+b+c, a+b-c, a-b+c and -a+b+c. For a
+    rectangular box that is the plain diagonal. No box -- zero, negative or
+    non-finite lengths, or angles that make no cell -- gives None.
+    """
+
+    lengths = np.asarray(lengths, dtype=np.float64)
+    angles = np.asarray(angles, dtype=np.float64)
+    if lengths.shape != (3,) or angles.shape != (3,):
+        return None
+    if not (np.isfinite(lengths).all() and np.isfinite(angles).all()):
+        return None
+    if (lengths <= 0).any() or (angles <= 0).any() or (angles >= 180).any():
+        return None
+
+    alpha, beta, gamma = np.radians(angles)
+    a_len, b_len, c_len = lengths
+    a = np.array([a_len, 0.0, 0.0])
+    b = np.array([b_len * np.cos(gamma), b_len * np.sin(gamma), 0.0])
+    cx = c_len * np.cos(beta)
+    cy = c_len * (np.cos(alpha) - np.cos(beta) * np.cos(gamma)) / np.sin(gamma)
+    cz_sq = c_len**2 - cx**2 - cy**2
+    if not np.isfinite(cz_sq) or cz_sq <= 0:
+        return None
+    c = np.array([cx, cy, np.sqrt(cz_sq)])
+
+    return float(max(np.linalg.norm(v) for v in (a + b + c, a + b - c, a - b + c, -a + b + c)))
+
+
+# --------------------------------------------------
+def jump_limit(diagonal: Optional[float]) -> float:
+    """MAX_JUMP, or twice the box diagonal when there is a box that large"""
+
+    if diagonal is None or not np.isfinite(diagonal) or diagonal <= 0:
+        return MAX_JUMP
+
+    return max(MAX_JUMP, 2.0 * float(diagonal))
+
+
+# --------------------------------------------------
+def regular_step(times) -> Optional[float]:
+    """
+    The file's usual spacing between frames, or None if time tells us nothing
+
+    The median, not the most common value: float32 times differ in the last
+    digits, so an exact count can split one real step into several. A file
+    with no times, or whose times do not advance, gives None.
+    """
+
+    if times is None or len(times) < 2:
+        return None
+
+    step = float(np.median(np.diff(np.asarray(times, dtype=np.float64))))
+    if not np.isfinite(step) or step <= 0:
+        return None
+
+    return step
+
+
+# --------------------------------------------------
+def find_jumps(moves, times, diagonals) -> Tuple[List[int], List[int]]:
+    """
+    Frames whose atoms moved too far, and the time boundaries that excused one
+
+    `moves[i]` is the largest one-atom move from frame i-1 to frame i (0 for
+    frame 0). `diagonals[i]` is frame i's box diagonal, or None.
+
+    A trajectory may be several runs joined, and between two runs the system
+    can be anywhere, so a jump is not tested across a boundary in time: a step
+    longer than the regular one, or one that goes back (a clock restart). Only
+    a boundary into a block of two or more frames counts. Otherwise a frame
+    damaged in its time as well as its coordinates -- a garbage time on a
+    damaged last frame -- would excuse itself.
+
+    Without usable times nothing can show a boundary, so every step is tested.
+    A wrong refusal is loud and gets fixed; a missed defect is silent.
+    """
+
+    frames = len(moves)
+    step = regular_step(times)
+
+    irregular = [False] * frames
+    if step is not None:
+        spacing = np.diff(np.asarray(times, dtype=np.float64))
+        for i in range(1, frames):
+            irregular[i] = not abs(spacing[i - 1] - step) <= STEP_TOLERANCE * step
+
+    boundaries = [
+        i
+        for i in range(1, frames)
+        if irregular[i] and i + 1 < frames and not irregular[i + 1]
+    ]
+    excused = set(boundaries)
+
+    jumps = [
+        i
+        for i in range(1, frames)
+        if i not in excused
+        and moves[i] >= jump_limit(None if diagonals is None else diagonals[i])
+    ]
+
+    return jumps, boundaries
+
+
+# --------------------------------------------------
+def largest_move(frame, before) -> float:
+    """
+    The largest one-atom move between two frames
+
+    Squared distances, and one square root at the end. A non-finite coordinate
+    is reported by BAD COORDINATES, so it does not count here.
+    """
+
+    with np.errstate(invalid="ignore", over="ignore"):
+        # float32 is plenty: the question is 5,000 A against a few hundred.
+        delta = np.subtract(frame, before, dtype=np.float32)
+        squared = np.einsum("ij,ij->i", delta, delta)
+    finite = squared[np.isfinite(squared)]
+
+    return float(np.sqrt(finite.max())) if finite.size else 0.0
+
+
+# --------------------------------------------------
 def classify_frame(coords) -> Optional[str]:
     """
     Say what is wrong with one frame's coordinates, if anything
@@ -286,7 +442,7 @@ def classify_frame(coords) -> Optional[str]:
 
 
 # --------------------------------------------------
-def scan_coordinates(coords) -> Tuple[List[int], List[int]]:
+def scan_coordinates(coords, moves=None) -> Tuple[List[int], List[int]]:
     """
     Scan NetCDF coordinates in blocks, without MDAnalysis
 
@@ -296,16 +452,25 @@ def scan_coordinates(coords) -> Tuple[List[int], List[int]]:
     frame whose box is zero -- which a non-periodic trajectory legitimately
     has in every frame.
 
-    Returns the all-zero frames and the frames that are not positions.
+    Returns the all-zero frames and the frames that are not positions. Given a
+    list as `moves`, the same pass appends each frame's largest one-atom move
+    from the frame before, for FRAME JUMPS; the last frame of each block is
+    carried into the next, so a jump at a block's first frame is measured too.
     """
 
     zero: List[int] = []
     bad: List[int] = []
     total = coords.shape[0]
+    before = None
 
     for start in range(0, total, CHUNK_FRAMES):
         block = np.asarray(coords[start : start + CHUNK_FRAMES])
         flat = block.reshape(block.shape[0], -1)
+
+        if moves is not None:
+            for frame in block:
+                moves.append(0.0 if before is None else largest_move(frame, before))
+                before = frame
 
         finite = np.isfinite(flat).all(axis=1)
         for offset in np.where(~finite)[0]:
@@ -323,13 +488,25 @@ def scan_coordinates(coords) -> Tuple[List[int], List[int]]:
 
 
 # --------------------------------------------------
-def netcdf_coordinates(path):
-    """A NetCDF's zero frames and not-a-position frames"""
+def netcdf_coordinates(path, moves=None):
+    """A NetCDF's zero frames and not-a-position frames (and moves, if asked)"""
 
     from scipy.io import netcdf_file
 
     with netcdf_file(path, "r", mmap=True) as ncf:
-        return scan_coordinates(ncf.variables["coordinates"])
+        return scan_coordinates(ncf.variables["coordinates"], moves)
+
+
+# --------------------------------------------------
+def netcdf_times(path):
+    """A NetCDF's frame times, or None when it has no time variable"""
+
+    from scipy.io import netcdf_file
+
+    with netcdf_file(path, "r", mmap=True) as ncf:
+        if "time" not in ncf.variables:
+            return None
+        return np.array(ncf.variables["time"][:], dtype=np.float64)
 
 
 # --------------------------------------------------
@@ -424,10 +601,20 @@ def check_netcdf(path: str, blank: dict, headers_only: bool) -> List[str]:
 
     zero_idx: List[int] = []
     bad_coord_idx: List[int] = []
+    jump_idx: List[int] = []
+    breaks: List[int] = []
     if not headers_only:
-        zero_idx, bad_coord_idx = netcdf_coordinates(path)
+        moves: List[float] = []
+        zero_idx, bad_coord_idx = netcdf_coordinates(path, moves)
+        diagonals = None
+        if cell is not None:
+            diagonals = [box_diagonal(ln, an) for ln, an in zip(*cell)]
+        jump_idx, breaks = find_jumps(moves, netcdf_times(path), diagonals)
 
     blank.update(
+        jump_frames=len(jump_idx),
+        jump_runs=group_runs(jump_idx),
+        time_breaks=breaks,
         bad_cell_frames=len(bad_cell),
         bad_cell_runs=group_runs(bad_cell),
         zero_frames=len(zero_idx),
@@ -442,6 +629,8 @@ def check_netcdf(path: str, blank: dict, headers_only: bool) -> List[str]:
         problems.append("ZERO FRAMES")
     if bad_coord_idx:
         problems.append("BAD COORDINATES")
+    if jump_idx:
+        problems.append("FRAME JUMPS")
 
     return problems
 
@@ -486,10 +675,27 @@ def check_via_mdanalysis(
     bad_coord_idx: List[int] = []
     lengths: List[List[float]] = []
     angles: List[List[float]] = []
+    moves: List[float] = []
+    times: List[float] = []
+    diagonals: List[Optional[float]] = []
+    before = None
 
     try:
         for step_ in universe.trajectory:
-            verdict = classify_frame(step_.positions)
+            positions = step_.positions
+            verdict = classify_frame(positions)
+
+            # DCD stores only a start and an interval, so its times always
+            # read back regular and every step of one is tested.
+            times.append(float(step_.time))
+            moves.append(0.0 if before is None else largest_move(positions, before))
+            before = positions.copy()
+            diagonals.append(
+                None
+                if step_.dimensions is None
+                else box_diagonal(step_.dimensions[:3], step_.dimensions[3:6])
+            )
+
             if verdict == "zero":
                 zero_idx.append(step_.frame)
             elif verdict is not None:
@@ -511,8 +717,12 @@ def check_via_mdanalysis(
         blank.update(read_error=f"{type(err).__name__}: {err}")
 
     bad_cell = scan_cell(lengths, angles) if lengths else []
+    jump_idx, breaks = find_jumps(moves, times, diagonals)
 
     blank.update(
+        jump_frames=len(jump_idx),
+        jump_runs=group_runs(jump_idx),
+        time_breaks=breaks,
         bad_cell_frames=len(bad_cell),
         bad_cell_runs=group_runs(bad_cell),
         zero_frames=len(zero_idx),
@@ -527,6 +737,8 @@ def check_via_mdanalysis(
         problems.append("ZERO FRAMES")
     if bad_coord_idx:
         problems.append("BAD COORDINATES")
+    if jump_idx:
+        problems.append("FRAME JUMPS")
 
     return problems
 
@@ -554,6 +766,9 @@ def check_trajectory(
         bad_cell_runs=[],
         bad_coord_frames=0,
         bad_coord_runs=[],
+        jump_frames=0,
+        jump_runs=[],
+        time_breaks=[],
         timestep_ps=None,
         read_error=None,
         problems=[],
@@ -619,6 +834,9 @@ def check_dir(directory: str, headers_only: bool) -> List[Finding]:
         bad_cell_runs=[],
         bad_coord_frames=0,
         bad_coord_runs=[],
+        jump_frames=0,
+        jump_runs=[],
+        time_breaks=[],
         timestep_ps=None,
         read_error=None,
         problems=[],
@@ -685,6 +903,11 @@ def describe(finding: Finding) -> str:
                 f"{finding.frames} (frames "
                 f"{format_runs(finding.bad_coord_runs)})"
             )
+        elif problem == "FRAME JUMPS":
+            parts.append(
+                f"FRAME JUMPS {finding.jump_frames} of {finding.frames} "
+                f"(frames {format_runs(finding.jump_runs)})"
+            )
         elif problem == "IMPLAUSIBLE TIMESTEP":
             parts.append(f"IMPLAUSIBLE TIMESTEP {finding.timestep_ps:g} ps")
         elif problem == "FRAME SCAN INCOMPLETE":
@@ -738,6 +961,7 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
     bad_cell = having("BAD UNIT CELL")
     zeros = having("ZERO FRAMES")
     bad_coord = having("BAD COORDINATES")
+    jumps = having("FRAME JUMPS")
     no_time = having("NO TIME AXIS")
     bad_step = having("IMPLAUSIBLE TIMESTEP")
     incomplete = having("FRAME SCAN INCOMPLETE")
@@ -848,6 +1072,30 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
             for f in bad_coord
         ]
 
+    if jumps:
+        section += 1
+        out += [
+            "",
+            f"{section}. ATOMS JUMP IMPOSSIBLY FAR BETWEEN FRAMES "
+            f"({sims(len(jumps))})",
+            "",
+            f"   In some frames atoms have moved {MAX_JUMP:,.0f} angstroms or more",
+            "   (or twice the box diagonal, if that is larger) since the frame",
+            "   before -- often a whole molecule, moved as one piece, in the",
+            "   last frame of a run. No simulation moves an atom that far in",
+            "   one frame, and wrapping in a periodic box cannot either. These",
+            "   frames need removing or rewriting. If the file joins separate",
+            "   runs, the jump is not counted where the time axis shows the",
+            "   join (a gap, or time starting again), so check that each run's",
+            "   times were kept.",
+            "",
+        ]
+        out += [
+            f"   {f.trajectory}: {f.jump_frames} of {f.frames} frames "
+            f"(frames {format_runs(f.jump_runs)})"
+            for f in jumps
+        ]
+
     if no_time:
         section += 1
         out += [
@@ -913,8 +1161,9 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
         out += [
             "",
             "Note: run without --headers-only to also scan the frames, which",
-            "is what finds all-zero frames and coordinates that are not",
-            "positions. Only NetCDF had its unit cell checked in this run.",
+            "is what finds all-zero frames, coordinates that are not",
+            "positions, and frame jumps. Only NetCDF had its unit cell checked",
+            "in this run.",
         ]
 
     return "\n".join(out)

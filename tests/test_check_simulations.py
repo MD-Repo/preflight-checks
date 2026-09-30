@@ -43,8 +43,13 @@ FRAMES = 6
 
 
 # --------------------------------------------------
-def write_nc(path, coords, lengths, angles, with_time=True):
-    """Write a minimal AMBER-convention NetCDF trajectory"""
+def write_nc(path, coords, lengths, angles, with_time=True, times=None):
+    """
+    Write a minimal AMBER-convention NetCDF trajectory
+
+    `times` overrides the default 7 ps spacing; `with_time=False` leaves the
+    time variable out.
+    """
 
     out = netcdf_file(str(path), "w", version=2)
     out.Conventions = "AMBER"
@@ -66,7 +71,10 @@ def write_nc(path, coords, lengths, angles, with_time=True):
     if with_time:
         var = out.createVariable("time", "f", ("frame",))
         var.units = "picosecond"
-        var[:] = np.arange(coords.shape[0], dtype=np.float32) * 7.0
+        if times is None:
+            var[:] = np.arange(coords.shape[0], dtype=np.float32) * 7.0
+        else:
+            var[:] = np.asarray(times, dtype=np.float32)
 
     var = out.createVariable("coordinates", "f", ("frame", "atom", "spatial"))
     var.units = "angstrom"
@@ -85,8 +93,14 @@ def write_nc(path, coords, lengths, angles, with_time=True):
 
 
 # --------------------------------------------------
-def write_via_mdanalysis(path, coords, dimensions):
-    """Write a trajectory in whatever format the extension names"""
+def write_via_mdanalysis(path, coords, dimensions, times=None):
+    """
+    Write a trajectory in whatever format the extension names
+
+    `times` sets each frame's time in ps. XTC and TRR store it as given; DCD
+    stores only a start and an interval, so it reads back as regular whatever
+    is passed.
+    """
 
     import MDAnalysis as mda
     from MDAnalysis.coordinates.memory import MemoryReader
@@ -94,7 +108,9 @@ def write_via_mdanalysis(path, coords, dimensions):
     universe = mda.Universe.empty(coords.shape[1], trajectory=True)
     universe.load_new(coords, format=MemoryReader, dimensions=dimensions)
     with mda.Writer(str(path), coords.shape[1]) as writer:
-        for _ in universe.trajectory:
+        for step in universe.trajectory:
+            if times is not None:
+                step.time = times[step.frame]
             writer.write(universe.atoms)
 
     return str(path)
@@ -530,3 +546,249 @@ def test_frame_classification_is_exclusive():
     assert c.classify_frame(np.full((ATOMS, 3), np.nan)) == "nonfinite"
     assert c.classify_frame(np.full((ATOMS, 3), 2.1474836e7)) == "huge"
     assert c.classify_frame(np.full((ATOMS, 3), 950.0)) is None
+
+
+# ==================================================
+# FRAME JUMPS
+#
+# The same rule as MDRepo's screen_trajectory.py (simulation-processing
+# 7884c2e), tested on the same shapes. A frame is flagged when an atom moves
+# MAX_JUMP (5,000 A) or more from the frame before -- or twice the box
+# diagonal, if larger -- unless the step is a boundary in time into a block of
+# two or more frames.
+# ==================================================
+
+CHAIN = 20  # the first CHAIN atoms play the protein chain the damage moves
+
+
+# --------------------------------------------------
+def steady(frames=FRAMES, atoms=ATOMS, box=50.0):
+    """A trajectory whose atoms stay put apart from thermal noise"""
+
+    rng = np.random.default_rng(88497)
+    start = rng.uniform(5.0, box - 5.0, (atoms, 3))
+    noise = rng.normal(0.0, 0.3, (frames, atoms, 3))
+    coords = (start + noise).astype(np.float32)
+    lengths = np.full((frames, 3), box, dtype=np.float64)
+    angles = np.full((frames, 3), 90.0, dtype=np.float64)
+    return coords, lengths, angles
+
+
+# --------------------------------------------------
+def offset(distance):
+    """One constant vector of the given length, like the offsets measured"""
+
+    v = np.array([37144.0, 81529.0, 233850.0])
+    return (v / np.linalg.norm(v) * distance).astype(np.float32)
+
+
+# --------------------------------------------------
+def writer(ext, coords, lengths, angles, times=None, with_time=True):
+    """A trajectory writer for make_dir, in the format ext names"""
+
+    def write(path):
+        if ext == "nc":
+            return write_nc(path, coords, lengths, angles, with_time, times)
+        box = lengths[0][0]
+        dims = boxes(len(coords), lengths=(box, box, box), angles=(90.0,) * 3)
+        return write_via_mdanalysis(path, coords, dims, times)
+
+    return write
+
+
+# --------------------------------------------------
+def test_the_jump_rule_matches_the_pipeline():
+    """The numbers and the decisions screen_trajectory.py makes"""
+
+    assert c.MAX_JUMP == 5.0e3
+    assert c.STEP_TOLERANCE == 0.01
+    assert c.jump_limit(None) == c.MAX_JUMP
+    assert c.jump_limit(273.0) == c.MAX_JUMP
+    assert c.jump_limit(5196.2) == pytest.approx(2 * 5196.2)
+    assert c.box_diagonal([158.0] * 3, [90.0] * 3) == pytest.approx(158.0 * 3**0.5)
+    assert c.box_diagonal([0.0] * 3, [90.0] * 3) is None
+
+    big = 250_425.0
+    assert c.find_jumps([0, 4, 4, 4, 4, big], [0, 1, 2, 3, 4, 5], None) == ([5], [])
+    # a gap into a block of three frames excuses the jump
+    assert c.find_jumps(
+        [0, 4, 4, big, 4, 4], [0, 10, 20, 5000, 5010, 5020], None
+    ) == ([], [3])
+    # a clock restart does too
+    assert c.find_jumps([0, 4, 4, big, 4, 4], [0, 10, 20, 0, 10, 20], None) == (
+        [],
+        [3],
+    )
+    # a one-frame block after a gap is not excused
+    assert c.find_jumps([0, 4, 4, 4, 4, big], [0, 1, 2, 3, 4, 9.9e9], None)[0] == [5]
+    # no usable times: every step tested
+    assert c.find_jumps([0, 4, 4, big, 4, 4], None, None) == ([3], [])
+    assert c.find_jumps([0, 4, 4, big, 4, 4], [0.0] * 6, None) == ([3], [])
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr", "dcd"])
+@pytest.mark.parametrize("distance", [15_425.0, 250_425.0])
+def test_a_ddd_damaged_last_frame_is_caught_in_every_format(tmp_path, ext, distance):
+    """
+    The last frame moves the first chain by one vector, well under 1e6 A
+
+    15,425 A is the smallest median offset measured (3fa3 Pro_lig30),
+    250,425 A the 6mlh one. BAD COORDINATES misses both.
+    """
+
+    coords, lengths, angles = steady()
+    coords[FRAMES - 1, :CHAIN] += offset(distance)
+
+    finding = only(make_dir(tmp_path, f"traj.{ext}", writer(ext, coords, lengths, angles)))
+
+    assert "FRAME JUMPS" in finding.problems
+    assert "BAD COORDINATES" not in finding.problems
+    assert finding.jump_runs == [(FRAMES - 1, FRAMES - 1)]
+    assert "FRAME JUMPS 1 of 6 (frames 5)" in c.describe(finding)
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc"])
+def test_a_wrapped_trajectory_is_clean(tmp_path, ext):
+    """MDR00088497: a 158 A box, atoms crossing it by a whole diagonal"""
+
+    box = 158.0
+    coords, lengths, angles = steady(box=box)
+    for frame in range(1, FRAMES, 2):
+        coords[frame, 0] += box
+
+    finding = only(make_dir(tmp_path, f"traj.{ext}", writer(ext, coords, lengths, angles)))
+
+    assert finding.problems == []
+
+
+# --------------------------------------------------
+def test_an_unwrapped_trajectory_far_from_the_origin_is_clean(tmp_path):
+    """Past 20,000 A from the origin, moving 5 A a frame"""
+
+    coords, lengths, angles = steady()
+    for frame in range(FRAMES):
+        coords[frame] += np.float32(19_990.0 + 5.0 * frame)
+
+    finding = only(make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles)))
+
+    assert finding.problems == []
+
+
+# --------------------------------------------------
+def test_a_huge_box_raises_the_limit_but_not_without_bound(tmp_path):
+    box = 3000.0
+    coords, lengths, angles = steady(box=box)
+    coords[3, 0] += box
+
+    finding = only(make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles)))
+    assert finding.problems == []
+
+    coords[FRAMES - 1, :CHAIN] += offset(20_000.0)
+    finding = only(make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles)))
+    assert "FRAME JUMPS" in finding.problems
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr"])
+@pytest.mark.parametrize(
+    "times",
+    [[0.0, 10.0, 20.0, 5000.0, 5010.0, 5020.0], [0.0, 10.0, 20.0, 0.0, 10.0, 20.0]],
+    ids=["gap", "clock-restart"],
+)
+def test_joined_runs_are_clean_and_the_join_is_recorded(tmp_path, ext, times):
+    coords, lengths, angles = steady()
+    coords[3:, :CHAIN] += offset(20_000.0)
+
+    finding = only(
+        make_dir(tmp_path, f"traj.{ext}", writer(ext, coords, lengths, angles, times))
+    )
+
+    assert finding.problems == []
+    assert finding.time_breaks == [3]
+
+
+# --------------------------------------------------
+def test_dcd_cannot_carry_a_join_so_its_jumps_are_flagged(tmp_path):
+    coords, lengths, angles = steady()
+    coords[3:, :CHAIN] += offset(20_000.0)
+    times = [0.0, 10.0, 20.0, 5000.0, 5010.0, 5020.0]
+
+    finding = only(
+        make_dir(tmp_path, "traj.dcd", writer("dcd", coords, lengths, angles, times))
+    )
+
+    assert "FRAME JUMPS" in finding.problems
+    assert finding.jump_runs == [(3, 3)]
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("last_time", [9.9e9, 0.0], ids=["garbage-time", "zero-time"])
+def test_a_damaged_last_frame_with_a_damaged_time_is_still_flagged(tmp_path, last_time):
+    coords, lengths, angles = steady()
+    coords[FRAMES - 1, :CHAIN] += offset(250_425.0)
+    times = [0.0, 1.0, 2.0, 3.0, 4.0, last_time]
+
+    finding = only(
+        make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles, times))
+    )
+
+    assert "FRAME JUMPS" in finding.problems
+    assert finding.jump_runs == [(FRAMES - 1, FRAMES - 1)]
+
+
+# --------------------------------------------------
+def test_a_netcdf_with_no_time_axis_has_every_step_tested(tmp_path):
+    """Contributor 289's MDR00048669 has no time variable"""
+
+    coords, lengths, angles = steady()
+    coords[3:, :CHAIN] += offset(20_000.0)
+
+    finding = only(
+        make_dir(
+            tmp_path, "traj.nc", writer("nc", coords, lengths, angles, with_time=False)
+        )
+    )
+
+    assert "NO TIME AXIS" in finding.problems
+    assert "FRAME JUMPS" in finding.problems
+    assert finding.jump_runs == [(3, 3)]
+
+
+# --------------------------------------------------
+def test_a_jump_across_a_read_chunk_is_caught(tmp_path):
+    """NetCDF is read CHUNK_FRAMES at a time; the boundary must be compared"""
+
+    frames = c.CHUNK_FRAMES + 10
+    coords, lengths, angles = steady(frames=frames)
+    coords[c.CHUNK_FRAMES :, :CHAIN] += offset(20_000.0)
+
+    finding = only(make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles)))
+
+    assert finding.jump_runs == [(c.CHUNK_FRAMES, c.CHUNK_FRAMES)]
+
+
+# --------------------------------------------------
+def test_headers_only_does_not_look_for_jumps(tmp_path):
+    coords, lengths, angles = steady()
+    coords[FRAMES - 1, :CHAIN] += offset(250_425.0)
+
+    finding = only(
+        make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles)),
+        headers_only=True,
+    )
+
+    assert "FRAME JUMPS" not in finding.problems
+
+
+# --------------------------------------------------
+def test_the_report_explains_frame_jumps(tmp_path):
+    coords, lengths, angles = steady()
+    coords[FRAMES - 1, :CHAIN] += offset(250_425.0)
+
+    finding = only(make_dir(tmp_path, "traj.nc", writer("nc", coords, lengths, angles)))
+    report = c.build_report([finding], headers_only=False)
+
+    assert "ATOMS JUMP IMPOSSIBLY FAR BETWEEN FRAMES (1 simulation)" in report
+    assert "traj.nc: 1 of 6 frames (frames 5)" in report
