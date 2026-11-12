@@ -792,3 +792,403 @@ def test_the_report_explains_frame_jumps(tmp_path):
 
     assert "ATOMS JUMP IMPOSSIBLY FAR BETWEEN FRAMES (1 simulation)" in report
     assert "traj.nc: 1 of 6 frames (frames 5)" in report
+
+
+# --------------------------------------------------
+# TOPOLOGY MISMATCH
+#
+# A small "protein": RESIDUES residues of N, CA, C, O with real bond lengths,
+# each residue BACKBONE_GAP apart so no bond is guessed between them. Its
+# guessed bonds are N-CA, CA-C and C-O in each residue: 30 bonds, 40 atoms.
+
+RESIDUES = 10
+BACKBONE = [
+    ("N", (0.0, 0.0, 0.0)),
+    ("CA", (1.46, 0.0, 0.0)),
+    ("C", (2.21, 1.30, 0.0)),
+    ("O", (2.21, 2.53, 0.0)),
+]
+
+
+# --------------------------------------------------
+def protein():
+    """Names, residue numbers and coordinates of the small protein"""
+
+    names, resids, coords = [], [], []
+    for res in range(RESIDUES):
+        origin = np.array([8.0 + 10.0 * (res % 4), 8.0 + 10.0 * (res // 4), 20.0])
+        for name, xyz in BACKBONE:
+            names.append(name)
+            resids.append(res + 1)
+            coords.append(origin + np.array(xyz))
+
+    return names, resids, np.array(coords, dtype=np.float32)
+
+
+# --------------------------------------------------
+def write_pdb(path, names, resids, coords, resname="ALA", box=None):
+    """A PDB with real coordinates, so bonds can be guessed from it"""
+
+    with open(path, "wt") as out:
+        if box is not None:
+            out.write(
+                f"CRYST1{box:9.3f}{box:9.3f}{box:9.3f}"
+                f"{90.0:7.2f}{90.0:7.2f}{90.0:7.2f} P 1           1\n"
+            )
+        for i, (name, resid, xyz) in enumerate(zip(names, resids, coords)):
+            out.write(
+                f"ATOM  {i + 1:>5} {name:<4} {resname} A{resid:>4}    "
+                f"{xyz[0]:8.3f}{xyz[1]:8.3f}{xyz[2]:8.3f}  1.00  0.00"
+                f"          {name[0]:>2}\n"
+            )
+        out.write("END\n")
+
+    return str(path)
+
+
+# --------------------------------------------------
+def write_psf(path, atoms, bonds):
+    """
+    A minimal CHARMM PSF: `atoms` as (resname, resid, name, mass), `bonds` as
+    1-based pairs. The bonds come from the file, not from any coordinates.
+    """
+
+    lines = ["PSF", "", "       1 !NTITLE", " REMARKS test", ""]
+    lines.append(f"{len(atoms):8d} !NATOM")
+    for i, (resname, resid, name, mass) in enumerate(atoms):
+        lines.append(
+            f"{i + 1:8d} A    {resid:<4d} {resname:<4} {name:<4} {name:<4}"
+            f" {0.0:10.6f}    {mass:10.4f}           0"
+        )
+    lines += ["", f"{len(bonds):8d} !NBOND: bonds"]
+    for start in range(0, len(bonds), 4):
+        lines.append(
+            "".join(f"{a:8d}{b:8d}" for a, b in bonds[start : start + 4])
+        )
+    for section in ("!NTHETA: angles", "!NPHI: dihedrals", "!NIMPHI: impropers"):
+        lines += ["", f"       0 {section}"]
+    lines.append("")
+
+    (path).write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+# --------------------------------------------------
+def frames_of(coords, frames=FRAMES, seed=4207):
+    """A trajectory of the structure with thermal noise, as float32"""
+
+    rng = np.random.default_rng(seed)
+    noise = rng.normal(0.0, 0.03, (frames,) + coords.shape)
+    return (coords[None, :, :] + noise).astype(np.float32)
+
+
+# --------------------------------------------------
+def bond_dir(tmp_path, traj, topology_writer, ext="xtc", box=60.0, top="top.pdb"):
+    """A directory with `traj` under `topology_writer`'s topology"""
+
+    lengths = np.full((len(traj), 3), box, dtype=np.float64)
+    angles = np.full((len(traj), 3), 90.0, dtype=np.float64)
+    name = f"traj.{ext}"
+    writer(ext, traj, lengths, angles)(tmp_path / name)
+    topology_writer(tmp_path / top)
+    (tmp_path / "mdrepo-metadata.toml").write_text(
+        f'trajectory_file_names = ["{name}"]\ntopology_file_name = "{top}"\n'
+    )
+    return str(tmp_path)
+
+
+# --------------------------------------------------
+def shuffled(coords, seed=11):
+    """The same atoms in another order: the same count, the wrong pairing"""
+
+    return coords[:, np.random.default_rng(seed).permutation(coords.shape[1]), :]
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr", "dcd"])
+def test_a_trajectory_that_fits_its_topology_is_clean(tmp_path, ext):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, frames_of(coords), lambda p: write_pdb(p, names, resids, coords), ext)
+    )
+
+    assert finding.problems == []
+    assert finding.bond_skipped is None
+    assert [f for f, _, _ in finding.bond_frames] == [0, FRAMES // 2, FRAMES - 1]
+    assert all(stretched == 0 and checked == 30 for _, stretched, checked in finding.bond_frames)
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr", "dcd"])
+def test_atoms_in_another_order_are_a_topology_mismatch(tmp_path, ext):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, shuffled(frames_of(coords)), lambda p: write_pdb(p, names, resids, coords), ext)
+    )
+
+    assert finding.problems == ["TOPOLOGY MISMATCH"]
+    assert finding.bond_worst
+    assert "TOPOLOGY MISMATCH frame 0" in c.describe(finding)
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("frame", [FRAMES // 2, FRAMES - 1])
+def test_a_mismatch_in_the_middle_or_last_frame_alone_is_caught(tmp_path, frame):
+    names, resids, coords = protein()
+    traj = frames_of(coords)
+    traj[frame] = shuffled(traj)[frame]
+
+    finding = only(
+        bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords))
+    )
+
+    assert "TOPOLOGY MISMATCH" in finding.problems
+    assert [(f, n > 0) for f, n, _ in finding.bond_frames] == [
+        (f, f == frame) for f in (0, FRAMES // 2, FRAMES - 1)
+    ]
+    assert finding.bond_worst[0].startswith(f"frame {frame}:")
+
+
+# --------------------------------------------------
+def test_a_few_stretched_bonds_are_noise_not_a_mismatch(tmp_path):
+    """One bond of 30 is 3%, under BAD_BOND_SHARE: reported in the counts only"""
+
+    names, resids, coords = protein()
+    traj = frames_of(coords)
+    traj[:, 3] += np.float32([0.0, 4.0, 0.0])  # residue 1's O, off its C
+
+    finding = only(
+        bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords))
+    )
+
+    assert finding.problems == []
+    assert all(n == 1 for _, n, _ in finding.bond_frames)
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc"])
+def test_a_molecule_split_by_the_box_uses_the_minimum_image(tmp_path, ext):
+    """
+    Wrapping puts half of every residue at the far side of the box
+
+    The raw distance across the split is ~58 A; through the box it is the
+    real bond. Every residue is split, so without the minimum image all of
+    them would fail.
+    """
+
+    names, resids, coords = protein()
+    box = 60.0
+    coords = coords.copy()
+    coords[:, 0] -= coords[1::4, 0].repeat(4) - 0.7  # straddle x = 0
+    traj = frames_of(coords) % box
+
+    finding = only(
+        bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords), ext, box=box)
+    )
+
+    assert finding.problems == []
+    assert all(n == 0 for _, n, _ in finding.bond_frames)
+
+
+# --------------------------------------------------
+def test_the_declared_bonds_of_a_psf_are_used_and_tip3p_is_clean(tmp_path):
+    """
+    CHARMM's TIP3P declares an H1-H2 bond of 1.51 A, past the hydrogens'
+    radii: BOND_FLOOR is what keeps every water from failing
+    """
+
+    atoms, bonds, coords = [], [], []
+    for w in range(12):
+        base = len(atoms) + 1
+        atoms += [("TIP3", w + 1, "OH2", 15.9994), ("TIP3", w + 1, "H1", 1.008), ("TIP3", w + 1, "H2", 1.008)]
+        bonds += [(base, base + 1), (base, base + 2), (base + 1, base + 2)]
+        origin = np.array([5.0 + 6.0 * (w % 4), 5.0 + 6.0 * (w // 4), 10.0])
+        coords += [origin, origin + [0.9572, 0.0, 0.0], origin + [-0.2400, 0.9266, 0.0]]
+    coords = np.array(coords, dtype=np.float32)
+
+    finding = only(
+        bond_dir(tmp_path, frames_of(coords), lambda p: write_psf(p, atoms, bonds), top="top.psf")
+    )
+    assert finding.problems == []
+    assert finding.bond_frames[0] == (0, 0, 36)
+
+    mismatch = tmp_path / "mismatch"
+    mismatch.mkdir()
+    finding = only(
+        bond_dir(mismatch, shuffled(frames_of(coords)), lambda p: write_psf(p, atoms, bonds), top="top.psf")
+    )
+    assert finding.problems == ["TOPOLOGY MISMATCH"]
+
+
+# --------------------------------------------------
+def test_a_coarse_grained_topology_is_skipped_and_says_why(tmp_path):
+    """Martini beads weigh 72 u: "BB" is not boron, and nothing is judged"""
+
+    atoms = [("ALA", i // 2 + 1, "BB" if i % 2 == 0 else "SC1", 72.0) for i in range(40)]
+    bonds = [(i, i + 1) for i in range(1, 40)]
+    coords = np.array([[5.0 + 4.7 * (i % 10), 5.0 + 4.7 * (i // 10), 10.0] for i in range(40)], dtype=np.float32)
+
+    finding = only(
+        bond_dir(tmp_path, shuffled(frames_of(coords)), lambda p: write_psf(p, atoms, bonds), top="top.psf")
+    )
+
+    assert finding.problems == []
+    assert "only 0 of 39 bonds join recognisable elements" in finding.bond_skipped
+    report = c.build_report([finding], headers_only=False)
+    assert "BOND CHECK SKIPPED (1 trajectories)" in report
+
+
+# --------------------------------------------------
+def test_a_structure_with_no_bonds_to_guess_is_skipped(tmp_path):
+    """The original fixture: every atom at the origin, so nothing is bonded"""
+
+    coords, lengths, angles = healthy()
+    finding = only(
+        make_dir(tmp_path, "traj.nc", lambda p: write_nc(p, coords, lengths, angles))
+    )
+
+    assert finding.problems == []
+    assert finding.bond_skipped == "no bonds could be guessed from the topology"
+
+
+# --------------------------------------------------
+def test_an_unreadable_topology_skips_the_bond_check(tmp_path):
+    coords, lengths, angles = healthy()
+    write_nc(tmp_path / "traj.nc", coords, lengths, angles)
+    (tmp_path / "top.parm7").write_text("not a topology anyone can read\n")
+    (tmp_path / "mdrepo-metadata.toml").write_text(
+        'trajectory_file_names = ["traj.nc"]\ntopology_file_name = "top.parm7"\n'
+    )
+
+    finding = only(str(tmp_path))
+
+    assert finding.problems == []
+    assert finding.bond_skipped == "the topology could not be read"
+
+
+# --------------------------------------------------
+def test_frames_already_reported_are_not_tested_again(tmp_path):
+    """An all-zero last frame is ZERO FRAMES, not also a mismatch"""
+
+    names, resids, coords = protein()
+    traj = frames_of(coords)
+    traj[FRAMES - 1] = 0.0
+
+    finding = only(
+        bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords), "nc")
+    )
+
+    assert finding.problems == ["ZERO FRAMES"]
+    assert [f for f, _, _ in finding.bond_frames] == [0, FRAMES // 2]
+
+
+# --------------------------------------------------
+def test_an_atom_mismatch_is_not_also_a_topology_mismatch(tmp_path):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, frames_of(coords[:-4]), lambda p: write_pdb(p, names, resids, coords))
+    )
+
+    assert finding.problems == ["ATOM MISMATCH"]
+    assert finding.bond_frames == []
+    assert finding.bond_skipped is None
+
+
+# --------------------------------------------------
+def test_headers_only_does_not_test_bonds(tmp_path):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, shuffled(frames_of(coords)), lambda p: write_pdb(p, names, resids, coords), "nc"),
+        headers_only=True,
+    )
+
+    assert finding.problems == []
+    assert finding.bond_frames == []
+    assert finding.bond_skipped is None
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize(
+    "name, mass, declared, expected",
+    [
+        ("CA", 12.011, None, "C"),  # alpha carbon
+        ("CA", 40.08, None, "CA"),  # calcium
+        ("CLA", 35.45, None, "CL"),  # CHARMM chloride
+        ("1HB", 1.008, None, "H"),  # leading digit
+        ("HB1", 3.024, None, "H"),  # repartitioned hydrogen
+        ("CB", 5.96, None, "C"),  # a methyl carbon after repartitioning
+        ("FE", 55.85, None, "FE"),
+        ("OW", None, None, "O"),  # no masses: the name decides
+        ("MW", 0.0, None, None),  # TIP4P virtual site
+        ("LP1", 0.0, None, None),  # lone pair
+        ("BB", 72.0, None, None),  # Martini bead
+        ("X1", 32.06, "S", "S"),  # the topology's element wins
+    ],
+)
+def test_elements_come_from_name_and_mass(name, mass, declared, expected):
+    assert c.assign_element(name, mass, declared) == expected
+
+
+# --------------------------------------------------
+def test_the_report_explains_a_topology_mismatch(tmp_path):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, shuffled(frames_of(coords)), lambda p: write_pdb(p, names, resids, coords))
+    )
+    report = c.build_report([finding], headers_only=False)
+
+    assert "TRAJECTORY FRAMES DO NOT FIT THE TOPOLOGY'S BONDS (1 simulation)" in report
+    assert "traj.xtc against top.pdb: frame 0 " in report
+    assert "      frame " in report  # the worst bonds, indented under it
+
+
+# --------------------------------------------------
+# Clean controls and shuffled pairs from real engines, using MDAnalysis's own
+# test files: CHARMM PSF + DCD, AMBER prmtop + NetCDF, GROMACS TPR + XTC, and
+# a .gro and a .pdb whose bonds are guessed. Skipped without MDAnalysisTests:
+#
+#     uv run --with pytest --with mdanalysis --with mdanalysistests pytest tests/
+
+
+ENGINES = [
+    ("PSF", "DCD", "traj.dcd"),
+    ("PRMncdf", "NCDF", "traj.nc"),
+    ("TPR", "XTC", "traj.xtc"),
+    ("GRO", "XTC", "traj.xtc"),
+    ("PDB_small", "DCD", "traj.dcd"),
+]
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("top_name, traj_name, out", ENGINES)
+@pytest.mark.parametrize("shuffle", [False, True], ids=["clean", "shuffled"])
+def test_real_engines(tmp_path, top_name, traj_name, out, shuffle):
+    datafiles = pytest.importorskip("MDAnalysisTests.datafiles")
+    import shutil
+
+    import MDAnalysis as mda
+
+    top = getattr(datafiles, top_name)
+    universe = mda.Universe(top, getattr(datafiles, traj_name))
+    order = np.arange(len(universe.atoms))
+    if shuffle:
+        third = len(order) // 3
+        order[:third] = np.random.default_rng(1).permutation(order[:third])
+
+    with mda.Writer(str(tmp_path / out), len(universe.atoms)) as writer_:
+        for _ in universe.trajectory[:5]:
+            writer_.write(universe.atoms[order])
+    shutil.copy(top, tmp_path / os.path.basename(top))
+    (tmp_path / "mdrepo-metadata.toml").write_text(
+        f'trajectory_file_names = ["{out}"]\n'
+        f'topology_file_name = "{os.path.basename(top)}"\n'
+    )
+
+    finding = only(str(tmp_path))
+
+    if shuffle:
+        assert finding.problems == ["TOPOLOGY MISMATCH"]
+    else:
+        assert finding.problems == []
+        assert finding.bond_skipped is None
+        assert all(n == 0 for _, n, _ in finding.bond_frames)

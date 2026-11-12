@@ -93,8 +93,9 @@ trajectory named in `trajectory_file_names` is checked against the topology in
 | `FRAME JUMPS` | In some frames an atom has moved 5,000 Å or more since the frame before (or twice the box diagonal, if that is larger). One submission's damaged last frames moved whole protein chains by one constant offset of 10⁴–10⁷ Å, often well under the `BAD COORDINATES` limit. Wrapping in a periodic box moves an atom at most one box diagonal, so it never trips this. If a file joins separate runs, a step where time jumps forward or starts again is treated as the join and not tested — unless the part after it is a single frame. | yes |
 | `NO TIME AXIS` | The NetCDF has no `time` variable, so frame spacing cannot be read from it. Either rewrite with time information, or declare `sampling_frequency_ps` in `mdrepo-metadata.toml`. **NetCDF only** — see below. | no |
 | `IMPLAUSIBLE TIMESTEP` | A DCD whose header declares a frame spacing below 1e-4 ps, which means the header carries a placeholder rather than the value. | no |
+| `TOPOLOGY MISMATCH` | In the first, middle or last frame, 5% or more of the topology's bonds are stretched past any real bond length (1.5× the atoms' covalent radii, never under 2 Å; minimum image when the frame has a box). The atom count agrees but the coordinates belong to another topology: one from another run or strip step, or the atoms in another order. Bonds come from the topology (`.psf`, `.prmtop`, `.tpr`, a readable GROMACS `.top`), or are guessed within each residue from a `.pdb`'s or `.gro`'s own coordinates. Atoms that are not a recognisable element by name and mass (coarse-grained beads, virtual sites) are left out; when too few bonds are left, or the topology cannot be read, the report lists the trajectory under **BOND CHECK SKIPPED** with the reason, and the exit status is not affected. | yes |
 
-`--headers-only` skips the three checks that read coordinates. It still checks
+`--headers-only` skips the four checks that read coordinates. It still checks
 the unit cell, because the cell arrays are three numbers per frame against tens
 of thousands of coordinates — cheap, though not as cheap as a true header read,
 since NetCDF keeps each frame's records together and reading them walks the
@@ -143,4 +144,12 @@ submission is sound.
 
 ```bash
 uv run --with pytest --with mdanalysis pytest tests/
+```
+
+`TOPOLOGY MISMATCH` is also tested on MDAnalysis's own CHARMM, AMBER and
+GROMACS files, clean and with the atom order shuffled. Those tests are skipped
+unless MDAnalysisTests is installed:
+
+```bash
+uv run --with pytest --with mdanalysis --with mdanalysistests pytest tests/
 ```

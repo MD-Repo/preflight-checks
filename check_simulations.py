@@ -68,6 +68,20 @@ needs a topology for none of them.
   reads back as ~4.9e-5 ps per frame. Anything below 1e-4 ps is reported. This
   is the one check here with no counterpart in check_amber.py.
 
+  TOPOLOGY MISMATCH -- the first, middle or last frame does not fit the
+  topology's bonds: BAD_BOND_SHARE (5%) or more of the bonds are stretched
+  past any real bond length. A trajectory can have the right atom count and
+  still not belong to its topology -- one from another run or another strip
+  step, or atoms in another order. Then the "bonded" atoms sit Angstroms to
+  tens of Angstroms apart, while a correct pairing breaks almost no bonds, so
+  the bounds can be loose. Distances use the minimum image when the frame has
+  a box. The bonds come from the topology (.psf, .prmtop, .tpr, a readable
+  GROMACS .top), or are guessed from the topology's own coordinates for .pdb
+  and .gro -- never from the trajectory, which would be circular. Bonds whose
+  atoms are not a recognisable element by name and mass (coarse-grained
+  beads, virtual sites) are left out, and when too few are left the check is
+  skipped and says why.
+
 Directories are found by looking for `mdrepo-metadata.toml`, so both a single
 simulation directory and a parent holding many of them work as arguments.
 
@@ -123,6 +137,60 @@ FLOOR_PS = 1.0e-4
 NETCDF_SUFFIXES = (".nc", ".netcdf")
 MDANALYSIS_SUFFIXES = (".xtc", ".trr", ".dcd", ".nc", ".netcdf")
 
+# TOPOLOGY MISMATCH. A bond is stretched when it is longer than BOND_STRETCH
+# times the sum of its atoms' covalent radii, and never at less than
+# BOND_FLOOR: CHARMM's TIP3P carries an H-H "bond" of 1.51 A, which the
+# radii alone would flag in every water. A frame fails when BAD_BOND_SHARE of
+# its checked bonds are stretched. A wrong pairing breaks most bonds by
+# Angstroms, a right one almost none, so none of these needs to be tight.
+BOND_STRETCH = 1.5
+BOND_FLOOR = 2.0
+BAD_BOND_SHARE = 0.05
+
+# Below this many checkable bonds, or below this share of the topology's
+# bonds, the check says it was skipped rather than give a verdict.
+MIN_BONDS = 10
+MIN_CHECKABLE_SHARE = 0.5
+
+# Guessing bonds from a .pdb's or .gro's own coordinates: two atoms are bonded
+# when closer than the sum of their covalent radii plus this, the usual rule.
+GUESS_SLACK = 0.45
+
+# Topology formats that carry coordinates but usually no (or only some) bonds.
+GUESS_SUFFIXES = (".pdb", ".ent", ".gro")
+
+# Covalent radius (A, Cordero et al. 2008) and standard atomic mass of the
+# elements bonded in biomolecular systems. An atom is given an element only
+# when its name starts with the symbol and, when the topology has masses, its
+# mass fits that element (see element_fits).
+ELEMENTS: Dict[str, Tuple[float, float]] = {
+    "H": (0.31, 1.008),
+    "LI": (1.28, 6.94),
+    "B": (0.84, 10.81),
+    "C": (0.76, 12.011),
+    "N": (0.71, 14.007),
+    "O": (0.66, 15.999),
+    "F": (0.57, 18.998),
+    "NA": (1.66, 22.990),
+    "MG": (1.41, 24.305),
+    "AL": (1.21, 26.982),
+    "SI": (1.11, 28.085),
+    "P": (1.07, 30.974),
+    "S": (1.05, 32.06),
+    "CL": (1.02, 35.45),
+    "K": (2.03, 39.098),
+    "CA": (1.76, 40.078),
+    "MN": (1.39, 54.938),
+    "FE": (1.32, 55.845),
+    "CO": (1.26, 58.933),
+    "NI": (1.24, 58.693),
+    "CU": (1.32, 63.546),
+    "ZN": (1.22, 65.38),
+    "SE": (1.20, 78.971),
+    "BR": (1.20, 79.904),
+    "I": (1.39, 126.904),
+}
+
 
 class Args(NamedTuple):
     """Command-line arguments"""
@@ -156,6 +224,28 @@ class Finding(NamedTuple):
     read_error: Optional[str]
     problems: List[str]
     error: Optional[str]
+    # TOPOLOGY MISMATCH: (frame, stretched, checked) for each frame tested,
+    # the worst bonds of the worst frame, and why the check did not run.
+    bond_frames: List[Tuple[int, int, int]] = []
+    bond_worst: List[str] = []
+    bond_skipped: Optional[str] = None
+
+
+class BondSet(NamedTuple):
+    """A topology's checkable bonds, with what is needed to report them"""
+
+    pairs: np.ndarray  # (n, 2) atom indexes
+    limits: np.ndarray  # (n,) the length past which each one is stretched
+    labels: List[str]  # one per atom: "LYS 12 NZ"
+    source: str  # "topology" or "guessed"
+
+
+class Topology(NamedTuple):
+    """What the topology file says, read once per directory"""
+
+    atoms: Optional[int]
+    bonds: Optional[BondSet]
+    bond_note: Optional[str]  # why there is no BondSet
 
 
 # --------------------------------------------------
@@ -563,6 +653,324 @@ def count_atoms(path: str) -> int:
 
 
 # --------------------------------------------------
+# TOPOLOGY MISMATCH
+
+
+# --------------------------------------------------
+def load_topology(path: str):
+    """
+    Open a topology on its own, as an MDAnalysis Universe
+
+    MDAnalysis reads ".top" as AMBER's format. A GROMACS .top that fails that
+    way is tried again as one, with its own directory for any #include.
+    """
+
+    import MDAnalysis as mda
+
+    try:
+        return mda.Universe(path)
+    except Exception:
+        if not path.lower().endswith(".top"):
+            raise
+
+    return mda.Universe(
+        path, topology_format="ITP", include_dir=os.path.dirname(path) or "."
+    )
+
+
+# --------------------------------------------------
+def element_fits(element: str, mass: Optional[float]) -> bool:
+    """
+    Whether a topology mass can belong to an element
+
+    Hydrogen mass repartitioning moves about 2 u onto each hydrogen from the
+    heavy atom it is bonded to, so a hydrogen may weigh up to about 4 u and a
+    heavy atom up to three hydrogens' worth less than standard. A virtual site
+    weighs 0, and a coarse-grained bead (72 u in Martini) fits no element its
+    name starts with. With no mass to go on, the name decides.
+    """
+
+    if mass is None or not np.isfinite(mass):
+        return True
+
+    if element == "H":
+        return 0.9 <= mass <= 4.2
+
+    standard = ELEMENTS[element][1]
+    return standard - 6.5 <= mass <= standard + 0.6
+
+
+# --------------------------------------------------
+def assign_element(
+    name: str, mass: Optional[float], declared: Optional[str]
+) -> Optional[str]:
+    """
+    One atom's element, or None when it is not a recognisable one
+
+    The topology's own element comes first, then the one- and two-letter
+    symbols the name starts with (leading digits dropped: "1HB"), the first
+    whose mass fits. One letter before two, so "CA" is an alpha carbon unless
+    it weighs 40 u.
+    """
+
+    candidates: List[str] = []
+
+    if declared is not None:
+        symbol = str(declared).strip().upper()
+        if symbol in ELEMENTS:
+            candidates.append(symbol)
+
+    letters = ""
+    for char in str(name).lstrip("0123456789").upper():
+        if not char.isalpha():
+            break
+        letters += char
+
+    for symbol in (letters[:1], letters[:2]):
+        if symbol in ELEMENTS and symbol not in candidates:
+            candidates.append(symbol)
+
+    for symbol in candidates:
+        if element_fits(symbol, mass):
+            return symbol
+
+    return None
+
+
+# --------------------------------------------------
+def atom_elements(names, masses, declared) -> List[Optional[str]]:
+    """Every atom's element (see assign_element), cached on what decides it"""
+
+    cache: Dict[tuple, Optional[str]] = {}
+    found: List[Optional[str]] = []
+
+    for i, name in enumerate(names):
+        mass = None if masses is None else float(masses[i])
+        symbol = None if declared is None else declared[i]
+        key = (name, None if mass is None else round(mass, 2), symbol)
+        if key not in cache:
+            cache[key] = assign_element(name, mass, symbol)
+        found.append(cache[key])
+
+    return found
+
+
+# --------------------------------------------------
+def usable_box(dims) -> Optional[np.ndarray]:
+    """A frame's box for minimum-image distances, or None if it has none"""
+
+    if dims is None:
+        return None
+
+    dims = np.asarray(dims, dtype=np.float64)
+    if dims.shape != (6,) or box_diagonal(dims[:3], dims[3:6]) is None:
+        return None
+
+    return dims.astype(np.float32)
+
+
+# --------------------------------------------------
+def guess_pairs(
+    coords, elements: List[Optional[str]], residues, box
+) -> np.ndarray:
+    """
+    Bonds guessed from a structure's own coordinates
+
+    Two atoms of recognisable elements in the same residue are bonded when
+    they are closer than the sum of their covalent radii plus GUESS_SLACK.
+    Within a residue only, so an ion sitting against a water is not bonded to
+    it and then "stretched" when it moves off; the links between residues are
+    few, and losing them costs the check nothing. Atoms closer than 0.1 A are
+    not bonded, so a file of placeholder coordinates (all at the origin)
+    gives no bonds rather than every pair.
+    """
+
+    from MDAnalysis.lib.distances import self_capped_distance
+
+    known = np.array([i for i, e in enumerate(elements) if e is not None])
+    if known.size < 2:
+        return np.empty((0, 2), dtype=np.int64)
+
+    radii = np.array([ELEMENTS[elements[i]][0] for i in known])
+    pairs, dist = self_capped_distance(
+        np.asarray(coords, dtype=np.float32)[known],
+        max_cutoff=2.0 * float(radii.max()) + GUESS_SLACK,
+        min_cutoff=0.1,
+        box=box,
+    )
+    if len(pairs) == 0:
+        return np.empty((0, 2), dtype=np.int64)
+
+    keep = dist < radii[pairs[:, 0]] + radii[pairs[:, 1]] + GUESS_SLACK
+    pairs = known[pairs[keep]].astype(np.int64)
+    residues = np.asarray(residues)
+
+    return pairs[residues[pairs[:, 0]] == residues[pairs[:, 1]]]
+
+
+# --------------------------------------------------
+def bond_limits(
+    pairs: np.ndarray, elements: List[Optional[str]]
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    The bonds that can be judged, and the length past which each is stretched
+
+    A bond is judged only when both its atoms are recognisable elements.
+    """
+
+    radius = np.array(
+        [np.nan if e is None else ELEMENTS[e][0] for e in elements]
+    )
+    if len(pairs) == 0:
+        return pairs, np.empty(0)
+
+    summed = radius[pairs[:, 0]] + radius[pairs[:, 1]]
+    keep = np.isfinite(summed)
+
+    return pairs[keep], np.maximum(BOND_FLOOR, BOND_STRETCH * summed[keep])
+
+
+class SkipBonds(Exception):
+    """The topology's bonds cannot be judged, for the reason given"""
+
+
+# --------------------------------------------------
+def read_topology(path: str) -> Topology:
+    """
+    The topology's atom count and the bonds TOPOLOGY MISMATCH will test
+
+    Never fails: a topology that cannot be read, or one whose bonds cannot be
+    judged, comes back with a note saying why, and the other checks go on.
+    """
+
+    try:
+        universe = load_topology(path)
+    except Exception:
+        return Topology(None, None, "the topology could not be read")
+
+    atoms = universe.atoms
+    natoms = len(atoms)
+
+    try:
+        return Topology(natoms, topology_bonds(path, universe), None)
+    except SkipBonds as skip:
+        return Topology(natoms, None, str(skip))
+    except Exception as err:
+        return Topology(natoms, None, f"its bonds could not be read ({err})")
+
+
+# --------------------------------------------------
+def topology_bonds(path: str, universe) -> BondSet:
+    """The BondSet for read_topology, or SkipBonds saying why there is none"""
+
+    atoms = universe.atoms
+    if not hasattr(atoms, "names"):
+        raise SkipBonds("the topology names no atoms")
+
+    elements = atom_elements(
+        atoms.names,
+        atoms.masses if hasattr(atoms, "masses") else None,
+        atoms.elements if hasattr(atoms, "elements") else None,
+    )
+
+    if path.lower().endswith(GUESS_SUFFIXES):
+        try:
+            coords = atoms.positions
+        except Exception:
+            raise SkipBonds("the topology has no coordinates to guess bonds from")
+        pairs = guess_pairs(
+            coords, elements, atoms.resindices, usable_box(universe.dimensions)
+        )
+        source = "guessed"
+        if len(pairs) == 0:
+            raise SkipBonds("no bonds could be guessed from the topology")
+    else:
+        if not hasattr(universe, "bonds") or len(universe.bonds) == 0:
+            raise SkipBonds("the topology declares no bonds")
+        pairs = np.asarray(universe.bonds.to_indices(), dtype=np.int64)
+        source = "topology"
+
+    total = len(pairs)
+    pairs, limits = bond_limits(pairs, elements)
+    if len(pairs) < MIN_BONDS or len(pairs) < MIN_CHECKABLE_SHARE * total:
+        raise SkipBonds(
+            f"only {len(pairs)} of {total} bonds join recognisable elements "
+            "(coarse-grained, or virtual sites?)"
+        )
+
+    labels = [
+        f"{resname} {resid} {name}"
+        for resname, resid, name in zip(
+            atoms.resnames if hasattr(atoms, "resnames") else [""] * len(atoms),
+            atoms.resids if hasattr(atoms, "resids") else [""] * len(atoms),
+            atoms.names,
+        )
+    ]
+
+    return BondSet(pairs=pairs, limits=limits, labels=labels, source=source)
+
+
+# --------------------------------------------------
+def sample_frames(frames: int) -> List[int]:
+    """The frames TOPOLOGY MISMATCH tests: first, middle and last"""
+
+    return sorted({0, frames // 2, frames - 1}) if frames > 0 else []
+
+
+# --------------------------------------------------
+def check_bonds(
+    bonds: BondSet, samples: dict, skip: set
+) -> Tuple[List[Tuple[int, int, int]], List[str], bool]:
+    """
+    Measure the topology's bonds in each sampled frame
+
+    `samples` maps a frame number to its (positions, box). Frames in `skip`
+    are already reported as not holding positions and are not tested again.
+    Returns (frame, stretched, checked) per frame tested, the worst bonds of
+    the frame with the largest share stretched, and whether any frame
+    reached BAD_BOND_SHARE.
+    """
+
+    from MDAnalysis.lib.distances import calc_bonds
+
+    stats: List[Tuple[int, int, int]] = []
+    worst: List[str] = []
+    worst_share = 0.0
+    mismatch = False
+
+    for frame in sorted(samples):
+        if frame in skip:
+            continue
+
+        positions, dims = samples[frame]
+        positions = np.asarray(positions, dtype=np.float32)
+        lengths = calc_bonds(
+            positions[bonds.pairs[:, 0]],
+            positions[bonds.pairs[:, 1]],
+            box=usable_box(dims),
+        )
+        stretched = lengths > bonds.limits
+        count = int(stretched.sum())
+        stats.append((frame, count, len(lengths)))
+
+        share = count / len(lengths)
+        mismatch |= share >= BAD_BOND_SHARE
+        if count and share > worst_share:
+            worst_share = share
+            ratio = np.where(stretched, lengths / bonds.limits, 0.0)
+            worst = [
+                f"frame {frame}: {bonds.labels[i]} - {bonds.labels[j]} "
+                f"{length:.1f} A"
+                for i, j, length in (
+                    (*bonds.pairs[k], lengths[k])
+                    for k in np.argsort(-ratio)[: min(5, count)]
+                )
+            ]
+
+    return stats, worst, mismatch
+
+
+# --------------------------------------------------
 def netcdf_shape(path: str) -> Tuple[int, int]:
     """A NetCDF's atom count and frame count, from its dimensions"""
 
@@ -574,7 +982,9 @@ def netcdf_shape(path: str) -> Tuple[int, int]:
 
 
 # --------------------------------------------------
-def check_netcdf(path: str, blank: dict, headers_only: bool) -> List[str]:
+def check_netcdf(
+    path: str, blank: dict, headers_only: bool, samples: Optional[dict] = None
+) -> List[str]:
     """
     Check a NetCDF without MDAnalysis, and say what is wrong with it
 
@@ -611,6 +1021,17 @@ def check_netcdf(path: str, blank: dict, headers_only: bool) -> List[str]:
             diagonals = [box_diagonal(ln, an) for ln, an in zip(*cell)]
         jump_idx, breaks = find_jumps(moves, netcdf_times(path), diagonals)
 
+        if samples is not None:
+            from scipy.io import netcdf_file
+
+            with netcdf_file(path, "r", mmap=True) as ncf:
+                coords = ncf.variables["coordinates"]
+                for frame in sample_frames(frames):
+                    box = None
+                    if cell is not None:
+                        box = np.concatenate([cell[0][frame], cell[1][frame]])
+                    samples[frame] = (np.array(coords[frame]), box)
+
     blank.update(
         jump_frames=len(jump_idx),
         jump_runs=group_runs(jump_idx),
@@ -637,7 +1058,11 @@ def check_netcdf(path: str, blank: dict, headers_only: bool) -> List[str]:
 
 # --------------------------------------------------
 def check_via_mdanalysis(
-    path: str, blank: dict, headers_only: bool, is_dcd: bool
+    path: str,
+    blank: dict,
+    headers_only: bool,
+    is_dcd: bool,
+    samples: Optional[dict] = None,
 ) -> List[str]:
     """
     Check an XTC, TRR or DCD frame by frame
@@ -679,6 +1104,9 @@ def check_via_mdanalysis(
     times: List[float] = []
     diagonals: List[Optional[float]] = []
     before = None
+    # TOPOLOGY MISMATCH's frames are kept as the scan passes them, so the
+    # check costs no second read of the file.
+    wanted = set(sample_frames(frames)) if samples is not None else set()
 
     try:
         for step_ in universe.trajectory:
@@ -695,6 +1123,12 @@ def check_via_mdanalysis(
                 if step_.dimensions is None
                 else box_diagonal(step_.dimensions[:3], step_.dimensions[3:6])
             )
+
+            if step_.frame in wanted:
+                samples[step_.frame] = (
+                    positions.copy(),
+                    None if step_.dimensions is None else step_.dimensions.copy(),
+                )
 
             if verdict == "zero":
                 zero_idx.append(step_.frame)
@@ -750,8 +1184,15 @@ def check_trajectory(
     topology: str,
     top_atoms: Optional[int],
     headers_only: bool,
+    bonds: Optional[BondSet] = None,
+    bond_note: Optional[str] = None,
 ) -> Finding:
-    """Check one trajectory against an already-read topology"""
+    """
+    Check one trajectory against an already-read topology
+
+    `bonds` are the topology's bonds for TOPOLOGY MISMATCH; without them,
+    `bond_note` says why, and is reported as the reason the check was skipped.
+    """
 
     blank = dict(
         directory=directory,
@@ -772,6 +1213,9 @@ def check_trajectory(
         timestep_ps=None,
         read_error=None,
         problems=[],
+        bond_frames=[],
+        bond_worst=[],
+        bond_skipped=None,
     )
 
     path = os.path.join(directory, trajectory)
@@ -789,12 +1233,14 @@ def check_trajectory(
         blank.update(frames=0, problems=["EMPTY TRAJECTORY"])
         return Finding(**blank, error=None)
 
+    samples = {} if bonds is not None and not headers_only else None
+
     try:
         if lowered.endswith(NETCDF_SUFFIXES):
-            problems = check_netcdf(path, blank, headers_only)
+            problems = check_netcdf(path, blank, headers_only, samples)
         else:
             problems = check_via_mdanalysis(
-                path, blank, headers_only, lowered.endswith(".dcd")
+                path, blank, headers_only, lowered.endswith(".dcd"), samples
             )
     except Exception as err:
         return Finding(**blank, error=f"unreadable trajectory: {err}")
@@ -806,6 +1252,30 @@ def check_trajectory(
         and "EMPTY TRAJECTORY" not in problems
     ):
         problems.insert(0, "ATOM MISMATCH")
+
+    if not headers_only and not (
+        {"ATOM MISMATCH", "EMPTY TRAJECTORY"} & set(problems)
+    ):
+        if bonds is None:
+            blank.update(bond_skipped=bond_note)
+        elif blank["traj_atoms"] != len(bonds.labels):
+            blank.update(bond_skipped="the trajectory's atom count is unknown")
+        else:
+            skip = {
+                frame
+                for start, end in blank["zero_runs"] + blank["bad_coord_runs"]
+                for frame in range(start, end + 1)
+            }
+            try:
+                stats, worst, mismatch = check_bonds(bonds, samples, skip)
+            except Exception as err:
+                blank.update(bond_skipped=f"bonds could not be measured ({err})")
+            else:
+                blank.update(bond_frames=stats, bond_worst=worst)
+                if not stats:
+                    blank.update(bond_skipped="no frame holds positions to test")
+                if mismatch:
+                    problems.append("TOPOLOGY MISMATCH")
 
     blank.update(problems=problems)
     return Finding(**blank, error=None)
@@ -840,6 +1310,9 @@ def check_dir(directory: str, headers_only: bool) -> List[Finding]:
         timestep_ps=None,
         read_error=None,
         problems=[],
+        bond_frames=[],
+        bond_worst=[],
+        bond_skipped=None,
     )
 
     try:
@@ -855,17 +1328,30 @@ def check_dir(directory: str, headers_only: bool) -> List[Finding]:
         return [Finding(**blank, error="metadata names no trajectory")]
 
     # A topology we cannot read is not fatal: every frame check below still
-    # works without it, and only ATOM MISMATCH is lost. Saying so beats
-    # refusing to look at the trajectory at all.
-    top_atoms: Optional[int] = None
+    # works without it, and only ATOM MISMATCH and TOPOLOGY MISMATCH are
+    # lost. Saying so beats refusing to look at the trajectory at all. Under
+    # --headers-only the bonds are not needed, so only the count is read.
+    top = Topology(None, None, "no topology is named in the metadata")
     if topology:
-        try:
-            top_atoms = count_atoms(os.path.join(directory, topology))
-        except Exception:
-            top_atoms = None
+        top_path = os.path.join(directory, topology)
+        if headers_only:
+            try:
+                top = Topology(count_atoms(top_path), None, None)
+            except Exception:
+                pass
+        else:
+            top = read_topology(top_path)
 
     return [
-        check_trajectory(directory, name, topology, top_atoms, headers_only)
+        check_trajectory(
+            directory,
+            name,
+            topology,
+            top.atoms,
+            headers_only,
+            top.bonds,
+            top.bond_note,
+        )
         for name in trajectories
     ]
 
@@ -912,10 +1398,22 @@ def describe(finding: Finding) -> str:
             parts.append(f"IMPLAUSIBLE TIMESTEP {finding.timestep_ps:g} ps")
         elif problem == "FRAME SCAN INCOMPLETE":
             parts.append(f"FRAME SCAN INCOMPLETE ({finding.read_error})")
+        elif problem == "TOPOLOGY MISMATCH":
+            parts.append(f"TOPOLOGY MISMATCH {stretched_bonds(finding)}")
         else:
             parts.append(problem)
 
     return "; ".join(parts)
+
+
+# --------------------------------------------------
+def stretched_bonds(finding: Finding) -> str:
+    """Bonds stretched per frame tested: "frame 0 812 of 3,365 bonds, ..." """
+
+    return ", ".join(
+        f"frame {frame} {stretched:,} of {checked:,} bonds stretched"
+        for frame, stretched, checked in finding.bond_frames
+    )
 
 
 # --------------------------------------------------
@@ -965,6 +1463,11 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
     no_time = having("NO TIME AXIS")
     bad_step = having("IMPLAUSIBLE TIMESTEP")
     incomplete = having("FRAME SCAN INCOMPLETE")
+    mismatched = having("TOPOLOGY MISMATCH")
+    bond_skips = sorted(
+        [f for f in findings if f.bond_skipped and not f.error],
+        key=lambda f: f.trajectory,
+    )
     errors = [f for f in findings if f.error]
     clean = [f for f in findings if not f.problems and not f.error]
 
@@ -1096,6 +1599,27 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
             for f in jumps
         ]
 
+    if mismatched:
+        section += 1
+        out += [
+            "",
+            f"{section}. TRAJECTORY FRAMES DO NOT FIT THE TOPOLOGY'S BONDS "
+            f"({sims(len(mismatched))})",
+            "",
+            "   In the first, middle or last frame, "
+            f"{BAD_BOND_SHARE:.0%} or more of the topology's",
+            "   bonds are stretched past any real bond length.",
+            "   The atom count agrees, but the coordinates do not belong to this",
+            "   topology: usually a topology from another run or another strip",
+            "   step, or the atoms in another order. Each of these needs the",
+            "   topology the trajectory was written with. If the system is",
+            "   coarse-grained or otherwise unusual, say so when submitting.",
+            "",
+        ]
+        for f in mismatched:
+            out.append(f"   {f.trajectory} against {f.topology}: {stretched_bonds(f)}")
+            out += [f"      {line}" for line in f.bond_worst]
+
     if no_time:
         section += 1
         out += [
@@ -1157,13 +1681,27 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
             for f in sorted(errors, key=lambda f: f.directory)
         ]
 
+    if bond_skips:
+        out += [
+            "",
+            f"BOND CHECK SKIPPED ({len(bond_skips)} trajectories)",
+            "",
+            "   These were not tested against their topology's bonds, so a",
+            "   mismatched pair among them would not be noticed. Nothing is",
+            "   wrong with them on that account.",
+            "",
+        ]
+        out += [
+            f"   {f.trajectory}: {f.bond_skipped}" for f in bond_skips
+        ]
+
     if headers_only:
         out += [
             "",
             "Note: run without --headers-only to also scan the frames, which",
             "is what finds all-zero frames, coordinates that are not",
-            "positions, and frame jumps. Only NetCDF had its unit cell checked",
-            "in this run.",
+            "positions, frame jumps, and frames that do not fit the topology.",
+            "Only NetCDF had its unit cell checked in this run.",
         ]
 
     return "\n".join(out)
@@ -1221,6 +1759,14 @@ def main() -> None:
     )
     for problem, count in sorted(counts.items()):
         print(f"  {problem}: {count}", file=sys.stderr)
+
+    # Not a problem, so it does not set the exit status, but it is said.
+    skipped = len([f for f in findings if f.bond_skipped and not f.error])
+    if skipped:
+        print(
+            f"  (bond check skipped for {skipped}; the report says why)",
+            file=sys.stderr,
+        )
 
     if args.report:
         with open(args.report, "wt") as out_fh:
