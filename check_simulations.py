@@ -89,6 +89,7 @@ Read-only: never writes into a simulation directory.
 """
 
 import argparse
+import json
 import os
 import sys
 import tomllib
@@ -200,6 +201,7 @@ class Args(NamedTuple):
     headers_only: bool
     report: Optional[str]
     quiet: bool
+    json: bool = False
 
 
 class Finding(NamedTuple):
@@ -287,6 +289,13 @@ def get_args() -> Args:
     )
 
     parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print every trajectory's finding as one JSON object, the last "
+        "line of stdout, for a program to read",
+    )
+
+    parser.add_argument(
         "-q",
         "--quiet",
         action="store_true",
@@ -304,6 +313,7 @@ def get_args() -> Args:
         headers_only=args.headers_only,
         report=args.report,
         quiet=args.quiet,
+        json=args.json,
     )
 
 
@@ -1438,6 +1448,29 @@ def format_runs(runs: List[Tuple[int, int]]) -> str:
 
 
 # --------------------------------------------------
+def json_report(findings: List[Finding], directories: int) -> dict:
+    """
+    Every finding, for a program to read
+
+    The plain-text report is for a person, and its wording can change; this
+    is what a program keys on. Each finding is every field of `Finding`
+    under its own name, so a check added later appears without a change
+    here, plus `summary`, the one line the console prints for it. A
+    program decides which problems matter to it by their names in
+    `problems`: an importer that declares `sampling_frequency_ps` itself
+    can act on TOPOLOGY MISMATCH and pass over NO TIME AXIS.
+    """
+
+    return {
+        "directories": directories,
+        "findings": [
+            {**finding._asdict(), "summary": describe(finding)}
+            for finding in findings
+        ],
+    }
+
+
+# --------------------------------------------------
 def build_report(findings: List[Finding], headers_only: bool) -> str:
     """
     Build a plain-text report of the problems found
@@ -1767,6 +1800,11 @@ def main() -> None:
             f"  (bond check skipped for {skipped}; the report says why)",
             file=sys.stderr,
         )
+
+    # Last, and alone on its line, so a caller can take the final line of
+    # stdout whatever else the run printed.
+    if args.json:
+        print(json.dumps(json_report(findings, len(dirs))), flush=True)
 
     if args.report:
         with open(args.report, "wt") as out_fh:

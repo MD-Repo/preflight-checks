@@ -1192,3 +1192,45 @@ def test_real_engines(tmp_path, top_name, traj_name, out, shuffle):
         assert finding.problems == []
         assert finding.bond_skipped is None
         assert all(n == 0 for _, n, _ in finding.bond_frames)
+
+
+# --------------------------------------------------
+# --json: what a program reads, rather than the report a person does.
+
+
+def test_json_names_a_topology_mismatch(tmp_path):
+    import json
+
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, shuffled(frames_of(coords)), lambda p: write_pdb(p, names, resids, coords))
+    )
+    report = json.loads(json.dumps(c.json_report([finding], 1)))
+
+    assert report["directories"] == 1
+    [got] = report["findings"]
+    assert got["problems"] == ["TOPOLOGY MISMATCH"]
+    assert got["trajectory"] == "traj.xtc" and got["topology"] == "top.pdb"
+    assert [frame for frame, _, _ in got["bond_frames"]] == [0, FRAMES // 2, FRAMES - 1]
+    assert got["summary"].startswith("TOPOLOGY MISMATCH")
+
+
+@pytest.mark.parametrize("shuffle, status", [(False, 0), (True, 1)], ids=["clean", "shuffled"])
+def test_json_is_the_last_line_of_stdout(tmp_path, shuffle, status):
+    import json
+    import subprocess
+
+    names, resids, coords = protein()
+    traj = frames_of(coords)
+    directory = bond_dir(tmp_path, shuffled(traj) if shuffle else traj,
+                         lambda p: write_pdb(p, names, resids, coords))
+    run = subprocess.run(
+        [sys.executable, c.__file__, "--json", "-q", directory],
+        capture_output=True, text=True,
+    )
+
+    assert run.returncode == status, run.stderr
+    report = json.loads(run.stdout.strip().splitlines()[-1])
+    [got] = report["findings"]
+    assert got["problems"] == (["TOPOLOGY MISMATCH"] if shuffle else [])
+    assert got["error"] is None
