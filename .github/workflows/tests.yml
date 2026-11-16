@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the floor the scripts declare (tomllib); the other is current.
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      # requirements.txt is what the virtual-environment install route reads,
+      # so CI tests that list rather than one of its own. MDAnalysisTests runs
+      # TOPOLOGY MISMATCH on MDAnalysis's own CHARMM, AMBER and GROMACS files,
+      # which are skipped without it.
+      - name: Run the tests
+        run: >
+          uv run --python ${{ matrix.python }} --no-project
+          --with-requirements requirements.txt --with pytest --with mdanalysistests
+          pytest tests/

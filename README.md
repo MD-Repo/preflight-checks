@@ -153,3 +153,7 @@ unless MDAnalysisTests is installed:
 ```bash
 uv run --with pytest --with mdanalysis --with mdanalysistests pytest tests/
 ```
+
+GitHub Actions runs the full set, MDAnalysisTests included, on Python 3.11 and
+3.13 for every push to `main` and every pull request
+(`.github/workflows/tests.yml`).
