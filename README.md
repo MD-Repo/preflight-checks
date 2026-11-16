@@ -75,6 +75,9 @@ uv run check_simulations.py --headers-only path/to/simulations
 
 # Write a plain-text report of the problems found
 uv run check_simulations.py -r problems.txt path/to/simulations
+
+# For a program: every trajectory's finding as JSON, the last line of stdout
+uv run check_simulations.py --json -q path/to/simulations
 ```
 
 Directories are found by looking for `mdrepo-metadata.toml`, and every
@@ -132,6 +135,13 @@ Nothing is ever modified: the checks only read.
 
 Exit status is 0 when everything is clean and 1 when anything was flagged, so it
 can gate a submission script.
+
+`--json` is for a program that needs to know which check fired, not only
+whether one did. The last line of stdout is one object: `directories`, and
+`findings`, one per trajectory with every field the check records (`problems`
+holds the names in the table above, `error` says why a trajectory could not be
+checked, `bond_skipped` why the bond check did not run) and `summary`, the line
+the console prints for it. The exit status is the same as without it.
 
 ### Tests
 
