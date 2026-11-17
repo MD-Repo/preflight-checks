@@ -73,6 +73,9 @@ uv run check_simulations.py path/to/simulations
 # Fast pass: skips the frame scans
 uv run check_simulations.py --headers-only path/to/simulations
 
+# Atom count and topology bonds only: the first, middle and last frames
+uv run check_simulations.py --sampled-frames path/to/simulations
+
 # Write a plain-text report of the problems found
 uv run check_simulations.py -r problems.txt path/to/simulations
 ```
@@ -128,6 +131,22 @@ For XTC, TRR and DCD it checks only the atom count and the DCD timestep,
 because those formats have to decompress a frame before even the box can be
 read. Run without it when you can.
 
+### What `--sampled-frames` skips
+
+`--sampled-frames` runs `ATOM MISMATCH`, `EMPTY TRAJECTORY` and `TOPOLOGY
+MISMATCH` without reading the whole file: after the header it seeks straight to
+the first, middle and last frames. It also keeps the checks `--headers-only`
+keeps (`IMPLAUSIBLE TIMESTEP` for DCD; `NO TIME AXIS` and `BAD UNIT CELL` for
+NetCDF). `ZERO FRAMES`, `BAD COORDINATES`, `FRAME JUMPS`, and `BAD UNIT CELL`
+for XTC, TRR and DCD need every frame and are not run. A sampled frame that
+holds no positions is left out of the bond check rather than reported, and one
+the reader cannot reach (a truncated last frame) is `FRAME SCAN INCOMPLETE`.
+
+Finding the frames still walks every frame header, which is cheap but not
+free. On a 13.7 GB, 50,001-frame XTC read from a cold cache, the full check
+took 234 s and `--sampled-frames` about 45 s, of which reading the three frames
+took a hundredth of a second.
+
 Nothing is ever modified: the checks only read.
 
 Exit status is 0 when everything is clean and 1 when anything was flagged, so it
@@ -152,6 +171,17 @@ unless MDAnalysisTests is installed:
 
 ```bash
 uv run --with pytest --with mdanalysis --with mdanalysistests pytest tests/
+```
+
+`tests/test_large_trajectory.py` runs `--sampled-frames` and the full scan on a
+large trajectory of your own and checks they agree on the bonds, and that the
+sampled run reads under a tenth of the file and takes under half the time. No
+large file is kept here, so it is skipped unless you name one:
+
+```bash
+PREFLIGHT_LARGE_TRAJECTORY=/path/to/big.xtc PREFLIGHT_LARGE_TOPOLOGY=/path/to/its.tpr \
+  uv run --no-project --with-requirements requirements.txt --with pytest \
+  pytest -s tests/test_large_trajectory.py
 ```
 
 GitHub Actions runs the full set, MDAnalysisTests included, on Python 3.11 and

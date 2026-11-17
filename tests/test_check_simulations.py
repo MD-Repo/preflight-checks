@@ -164,10 +164,10 @@ def make_dir(tmp_path, name, trajectory_writer, top_atoms=ATOMS):
 
 
 # --------------------------------------------------
-def only(directory, headers_only=False):
+def only(directory, headers_only=False, sampled=False):
     """The one finding for a directory declaring one trajectory"""
 
-    findings = c.check_dir(directory, headers_only)
+    findings = c.check_dir(directory, headers_only, sampled)
     assert len(findings) == 1
     assert findings[0].error is None, findings[0].error
     return findings[0]
@@ -1192,3 +1192,128 @@ def test_real_engines(tmp_path, top_name, traj_name, out, shuffle):
         assert finding.problems == []
         assert finding.bond_skipped is None
         assert all(n == 0 for _, n, _ in finding.bond_frames)
+
+
+# --------------------------------------------------
+# --sampled-frames: the header and the three frames TOPOLOGY MISMATCH tests,
+# reached by seeking, with nothing between them read. The same verdict on the
+# bonds as the full scan, and none of the scan's own findings.
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr", "dcd"])
+@pytest.mark.parametrize("shuffle", [False, True], ids=["clean", "shuffled"])
+def test_sampled_frames_agree_with_the_full_scan_on_the_bonds(tmp_path, ext, shuffle):
+    names, resids, coords = protein()
+    traj = shuffled(frames_of(coords)) if shuffle else frames_of(coords)
+    directory = bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords), ext)
+
+    sampled = only(directory, sampled=True)
+    full = only(directory)
+
+    assert sampled.problems == full.problems == (["TOPOLOGY MISMATCH"] if shuffle else [])
+    assert sampled.bond_frames == full.bond_frames
+    assert [f for f, _, _ in sampled.bond_frames] == [0, FRAMES // 2, FRAMES - 1]
+    assert sampled.frames == full.frames == FRAMES
+    assert sampled.bond_skipped is None
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc", "trr", "dcd"])
+def test_sampled_frames_do_not_read_the_frames_between(tmp_path, ext):
+    """Damage in frames 1 and 2 is the full scan's to find, not this mode's"""
+
+    names, resids, coords = protein()
+    traj = frames_of(coords)
+    traj[1] = 0.0
+    traj[2, 0] = 1.0e7
+
+    directory = bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords), ext)
+
+    assert only(directory, sampled=True).problems == []
+    assert {"ZERO FRAMES", "BAD COORDINATES"} <= set(only(directory).problems)
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["nc", "xtc"])
+def test_a_sampled_frame_that_holds_no_positions_is_not_tested(tmp_path, ext):
+    """An all-zero last frame would break every bond; it is left out instead"""
+
+    names, resids, coords = protein()
+    traj = frames_of(coords)
+    traj[FRAMES - 1] = 0.0
+
+    finding = only(
+        bond_dir(tmp_path, traj, lambda p: write_pdb(p, names, resids, coords), ext),
+        sampled=True,
+    )
+
+    assert finding.problems == []
+    assert [f for f, _, _ in finding.bond_frames] == [0, FRAMES // 2]
+
+
+# --------------------------------------------------
+def test_sampled_frames_still_check_the_atom_count(tmp_path):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, frames_of(coords[:-4]), lambda p: write_pdb(p, names, resids, coords)),
+        sampled=True,
+    )
+
+    assert finding.problems == ["ATOM MISMATCH"]
+    assert finding.bond_frames == []
+
+
+# --------------------------------------------------
+def test_sampled_frames_keep_the_netcdf_header_checks(tmp_path):
+    """The cell and the time axis are as cheap here as under --headers-only"""
+
+    coords, lengths, angles = healthy()
+    lengths[2] = 0.0
+    finding = only(
+        make_dir(tmp_path, "traj.nc", lambda p: write_nc(p, coords, lengths, angles, with_time=False)),
+        sampled=True,
+    )
+
+    assert finding.problems == ["NO TIME AXIS", "BAD UNIT CELL"]
+
+
+# --------------------------------------------------
+@pytest.mark.parametrize("ext", ["xtc", "trr"])
+def test_a_truncated_last_frame_is_reported_under_sampled_frames(tmp_path, ext):
+    """The seek to the last frame fails; the frames before it are still tested"""
+
+    names, resids, coords = protein()
+    directory = bond_dir(tmp_path, frames_of(coords), lambda p: write_pdb(p, names, resids, coords), ext)
+    path = tmp_path / f"traj.{ext}"
+    with open(path, "r+b") as fh:
+        fh.truncate(path.stat().st_size - 40)
+
+    finding = only(directory, sampled=True)
+
+    assert finding.problems == ["FRAME SCAN INCOMPLETE"]
+    assert finding.read_error
+    assert [f for f, _, _ in finding.bond_frames] == [0, FRAMES // 2]
+
+
+# --------------------------------------------------
+def test_sampled_frames_and_headers_only_cannot_be_combined(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["check_simulations.py", "--headers-only", "--sampled-frames", "x"])
+    with pytest.raises(SystemExit):
+        c.get_args()
+
+    monkeypatch.setattr(sys, "argv", ["check_simulations.py", "--sampled-frames", "x"])
+    assert c.get_args().sampled_frames
+
+
+# --------------------------------------------------
+def test_the_report_says_what_sampled_frames_left_out(tmp_path):
+    names, resids, coords = protein()
+    finding = only(
+        bond_dir(tmp_path, frames_of(coords), lambda p: write_pdb(p, names, resids, coords)),
+        sampled=True,
+    )
+    report = c.build_report([finding], headers_only=False, sampled=True)
+
+    assert "--sampled-frames read only the first, middle and last" in report
+    assert "--headers-only" not in report
