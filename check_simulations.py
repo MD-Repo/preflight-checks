@@ -85,6 +85,14 @@ needs a topology for none of them.
 Directories are found by looking for `mdrepo-metadata.toml`, so both a single
 simulation directory and a parent holding many of them work as arguments.
 
+--sampled-frames reads the header and then seeks straight to the first,
+middle and last frames, for ATOM MISMATCH and TOPOLOGY MISMATCH without a
+full read. On a 13.7 GB, 50,001-frame XTC from a cold cache that took 45 s
+against 234 s for the full scan: finding the frames still walks every frame
+header (0.2 GB of reads), but nothing between them is decompressed. ZERO
+FRAMES, BAD COORDINATES, FRAME JUMPS, and BAD UNIT CELL outside NetCDF need
+every frame and are not run.
+
 Read-only: never writes into a simulation directory.
 """
 
@@ -200,6 +208,7 @@ class Args(NamedTuple):
     headers_only: bool
     report: Optional[str]
     quiet: bool
+    sampled_frames: bool = False
 
 
 class Finding(NamedTuple):
@@ -273,10 +282,19 @@ def get_args() -> Args:
         help="Parallel workers",
     )
 
-    parser.add_argument(
+    depth = parser.add_mutually_exclusive_group()
+
+    depth.add_argument(
         "--headers-only",
         action="store_true",
         help="Skip the frame scans; NetCDF still has its unit cell checked",
+    )
+
+    depth.add_argument(
+        "--sampled-frames",
+        action="store_true",
+        help="Read only the header and the first, middle and last frames: "
+        "the atom count and the topology's bonds, but no frame scans",
     )
 
     parser.add_argument(
@@ -304,6 +322,7 @@ def get_args() -> Args:
         headers_only=args.headers_only,
         report=args.report,
         quiet=args.quiet,
+        sampled_frames=args.sampled_frames,
     )
 
 
@@ -983,7 +1002,11 @@ def netcdf_shape(path: str) -> Tuple[int, int]:
 
 # --------------------------------------------------
 def check_netcdf(
-    path: str, blank: dict, headers_only: bool, samples: Optional[dict] = None
+    path: str,
+    blank: dict,
+    headers_only: bool,
+    samples: Optional[dict] = None,
+    sampled: bool = False,
 ) -> List[str]:
     """
     Check a NetCDF without MDAnalysis, and say what is wrong with it
@@ -993,6 +1016,9 @@ def check_netcdf(
     `check_amber.py` and the pipeline's own screen so the three cannot
     disagree, and MDAnalysis cannot read a NetCDF frame whose box is zero --
     which a non-periodic trajectory legitimately has in every frame.
+
+    `sampled` skips the coordinate scan as `headers_only` does, but still
+    reads the frames TOPOLOGY MISMATCH tests into `samples`.
     """
 
     problems: List[str] = []
@@ -1013,7 +1039,7 @@ def check_netcdf(
     bad_coord_idx: List[int] = []
     jump_idx: List[int] = []
     breaks: List[int] = []
-    if not headers_only:
+    if not headers_only and not sampled:
         moves: List[float] = []
         zero_idx, bad_coord_idx = netcdf_coordinates(path, moves)
         diagonals = None
@@ -1021,16 +1047,21 @@ def check_netcdf(
             diagonals = [box_diagonal(ln, an) for ln, an in zip(*cell)]
         jump_idx, breaks = find_jumps(moves, netcdf_times(path), diagonals)
 
-        if samples is not None:
-            from scipy.io import netcdf_file
+    if not headers_only and samples is not None:
+        from scipy.io import netcdf_file
 
-            with netcdf_file(path, "r", mmap=True) as ncf:
-                coords = ncf.variables["coordinates"]
-                for frame in sample_frames(frames):
-                    box = None
-                    if cell is not None:
-                        box = np.concatenate([cell[0][frame], cell[1][frame]])
-                    samples[frame] = (np.array(coords[frame]), box)
+        with netcdf_file(path, "r", mmap=True) as ncf:
+            coords = ncf.variables["coordinates"]
+            for frame in sample_frames(frames):
+                positions = np.array(coords[frame])
+                # Without the scan nothing else has looked at this frame,
+                # so one that holds no positions is left out here.
+                if classify_frame(positions) is not None:
+                    continue
+                box = None
+                if cell is not None:
+                    box = np.concatenate([cell[0][frame], cell[1][frame]])
+                samples[frame] = (positions, box)
 
     blank.update(
         jump_frames=len(jump_idx),
@@ -1057,18 +1088,56 @@ def check_netcdf(
 
 
 # --------------------------------------------------
+def read_samples(
+    universe, frames: int, blank: dict, samples: Optional[dict]
+) -> List[str]:
+    """
+    Seek to the frames TOPOLOGY MISMATCH tests, for --sampled-frames
+
+    The seek uses the index the reader built when it counted the frames, so
+    nothing between the samples is decompressed. A frame that holds no
+    positions is left out of `samples`, as the full scan leaves out the
+    frames it reports. A frame the reader cannot reach is FRAME SCAN
+    INCOMPLETE; the frames read before it are still tested.
+    """
+
+    if samples is None:
+        return []
+
+    try:
+        for frame in sample_frames(frames):
+            step_ = universe.trajectory[frame]
+            positions = step_.positions
+            if classify_frame(positions) is not None:
+                continue
+            samples[frame] = (
+                positions.copy(),
+                None if step_.dimensions is None else step_.dimensions.copy(),
+            )
+    except Exception as err:
+        blank.update(read_error=f"{type(err).__name__}: {err}")
+        return ["FRAME SCAN INCOMPLETE"]
+
+    return []
+
+
+# --------------------------------------------------
 def check_via_mdanalysis(
     path: str,
     blank: dict,
     headers_only: bool,
     is_dcd: bool,
     samples: Optional[dict] = None,
+    sampled: bool = False,
 ) -> List[str]:
     """
     Check an XTC, TRR or DCD frame by frame
 
     None of the three needs a topology to open, so nothing here depends on
     the structure or topology file being readable.
+
+    `sampled` reads only the frames TOPOLOGY MISMATCH tests, by seeking to
+    them, instead of scanning every frame.
     """
 
     import MDAnalysis as mda
@@ -1095,6 +1164,9 @@ def check_via_mdanalysis(
         # Every remaining check needs the frames, and for these formats even
         # the box does: a frame has to be decompressed to read it.
         return problems
+
+    if sampled:
+        return problems + read_samples(universe, frames, blank, samples)
 
     zero_idx: List[int] = []
     bad_coord_idx: List[int] = []
@@ -1186,12 +1258,14 @@ def check_trajectory(
     headers_only: bool,
     bonds: Optional[BondSet] = None,
     bond_note: Optional[str] = None,
+    sampled: bool = False,
 ) -> Finding:
     """
     Check one trajectory against an already-read topology
 
     `bonds` are the topology's bonds for TOPOLOGY MISMATCH; without them,
     `bond_note` says why, and is reported as the reason the check was skipped.
+    `sampled` reads only the frames that check tests (--sampled-frames).
     """
 
     blank = dict(
@@ -1237,10 +1311,15 @@ def check_trajectory(
 
     try:
         if lowered.endswith(NETCDF_SUFFIXES):
-            problems = check_netcdf(path, blank, headers_only, samples)
+            problems = check_netcdf(path, blank, headers_only, samples, sampled)
         else:
             problems = check_via_mdanalysis(
-                path, blank, headers_only, lowered.endswith(".dcd"), samples
+                path,
+                blank,
+                headers_only,
+                lowered.endswith(".dcd"),
+                samples,
+                sampled,
             )
     except Exception as err:
         return Finding(**blank, error=f"unreadable trajectory: {err}")
@@ -1282,7 +1361,9 @@ def check_trajectory(
 
 
 # --------------------------------------------------
-def check_dir(directory: str, headers_only: bool) -> List[Finding]:
+def check_dir(
+    directory: str, headers_only: bool, sampled: bool = False
+) -> List[Finding]:
     """
     Check one simulation directory
 
@@ -1351,6 +1432,7 @@ def check_dir(directory: str, headers_only: bool) -> List[Finding]:
             headers_only,
             top.bonds,
             top.bond_note,
+            sampled,
         )
         for name in trajectories
     ]
@@ -1438,7 +1520,9 @@ def format_runs(runs: List[Tuple[int, int]]) -> str:
 
 
 # --------------------------------------------------
-def build_report(findings: List[Finding], headers_only: bool) -> str:
+def build_report(
+    findings: List[Finding], headers_only: bool, sampled: bool = False
+) -> str:
     """
     Build a plain-text report of the problems found
 
@@ -1704,6 +1788,16 @@ def build_report(findings: List[Finding], headers_only: bool) -> str:
             "Only NetCDF had its unit cell checked in this run.",
         ]
 
+    if sampled:
+        out += [
+            "",
+            "Note: --sampled-frames read only the first, middle and last",
+            "frames, for the atom count and the topology's bonds. Run without",
+            "it to scan every frame, which is what finds all-zero frames,",
+            "coordinates that are not positions, frame jumps, and (outside",
+            "NetCDF) frames with no usable box.",
+        ]
+
     return "\n".join(out)
 
 
@@ -1719,14 +1813,17 @@ def main() -> None:
 
     print(
         f"Checking {len(dirs)} directory(s) with {args.threads} thread(s)"
-        + (" (headers only)" if args.headers_only else ""),
+        + (" (headers only)" if args.headers_only else "")
+        + (" (sampled frames)" if args.sampled_frames else ""),
         file=sys.stderr,
     )
 
     findings: List[Finding] = []
     with ThreadPoolExecutor(max_workers=args.threads) as pool:
         futures = [
-            pool.submit(check_dir, directory, args.headers_only)
+            pool.submit(
+                check_dir, directory, args.headers_only, args.sampled_frames
+            )
             for directory in dirs
         ]
 
@@ -1770,7 +1867,9 @@ def main() -> None:
 
     if args.report:
         with open(args.report, "wt") as out_fh:
-            out_fh.write(build_report(findings, args.headers_only))
+            out_fh.write(
+                build_report(findings, args.headers_only, args.sampled_frames)
+            )
             out_fh.write("\n")
         print(f"\nReport written to '{args.report}'", file=sys.stderr)
 
